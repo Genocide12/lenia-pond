@@ -486,21 +486,29 @@ export default function Page() {
             <HelpCircle className="h-4.5 w-4.5" />
           </button>
           {helpOpen && (
-            <div className="absolute right-0 top-11 z-20 w-72 rounded-xl border border-white/10 bg-[#0b1512] p-4 text-sm leading-relaxed text-neutral-300 shadow-xl">
-              <p>
-                Это <b className="text-emerald-300">Ления</b> — непрерывная «игра в жизнь»: каждый житель —
-                самоподдерживающаяся волна чисел.
-              </p>
-              <p className="mt-2">
-                У пруда нет краёв: уплыв за край, существо появляется с противоположной стороны.
-              </p>
-              <p className="mt-2">
-                Грибы делятся и заполняют пруд колонией. Кликните по воде, чтобы поселить жителя.
-              </p>
-              <p className="mt-2 text-xs text-neutral-500">
-                Реконструкция Bert Wang-Chak Chan · github.com/Chakazul/Lenia
-              </p>
-            </div>
+            <>
+              <button
+                className="fixed inset-0 z-10 cursor-default"
+                onClick={() => setHelpOpen(false)}
+                aria-label="Закрыть"
+                tabIndex={-1}
+              />
+              <div className="absolute right-0 top-11 z-20 w-72 rounded-xl border border-white/10 bg-[#0b1512] p-4 text-sm leading-relaxed text-neutral-300 shadow-xl">
+                <p>
+                  Это <b className="text-emerald-300">Ления</b> — непрерывная «игра в жизнь»: каждый житель —
+                  самоподдерживающаяся волна чисел.
+                </p>
+                <p className="mt-2">
+                  У пруда нет краёв: уплыв за край, существо появляется с противоположной стороны.
+                </p>
+                <p className="mt-2">
+                  Грибы делятся и заполняют пруд колонией. Кликните по воде, чтобы поселить жителя.
+                </p>
+                <p className="mt-2 text-xs text-neutral-500">
+                  Реконструкция Bert Wang-Chak Chan · github.com/Chakazul/Lenia
+                </p>
+              </div>
+            </>
           )}
         </div>
       </header>
