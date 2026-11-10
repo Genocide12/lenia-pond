@@ -12,19 +12,20 @@ const jetbrainsMono = JetBrains_Mono({
   subsets: ["latin", "cyrillic"],
 });
 
+const REPO_NAME = process.env.REPO_NAME || "lenia-aquarium";
+const BASE = process.env.EXPORT_STATIC === "1" ? `/${REPO_NAME}` : "";
+
 export const metadata: Metadata = {
   title: "Пруд Лении — живая математика в браузере",
   description:
     "Два живых мира: головастики, собирающиеся из хаоса, и грибы, делящиеся на колонию. Интерактивная реконструкция Лении Бёрта Чана. Понятно в любом возрасте.",
   keywords: ["Ления", "Lenia", "клеточные автоматы", "Game of Life", "искусственная жизнь", "ALife", "WebGL"],
-  authors: [{ name: "Z.ai" }],
   icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    icon: `${BASE}/favicon.svg`,
   },
   openGraph: {
     title: "Пруд Лении — живая математика в браузере",
     description: "Головастики рождаются из хаоса, грибы делятся — живой мир по трём правилам",
-    siteName: "Z.ai",
     type: "website",
   },
 };
