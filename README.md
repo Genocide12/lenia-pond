@@ -11,7 +11,7 @@
 Реконструкция оригинальной [Lenia](https://github.com/Chakazul/Lenia)
 Бёрта Ван-Чака Чана (Python/animals.json) на WebGL2.
 
-**Живая версия:** GitHub Pages (ссылка в About репозитория)
+**Живая версия:** <https://genocide12.github.io/lenia-pond/>
 
 ## Управление
 
