@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import { Manrope, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
-import { Toaster } from "@/components/ui/toaster";
 
 const manrope = Manrope({
   variable: "--font-geist-sans",
@@ -14,17 +13,17 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Ления — живой аквариум искусственной жизни",
+  title: "Пруд Лении — живая математика в браузере",
   description:
-    "Цифровые существа, которые рождаются, плавают, сталкиваются и делятся, — прямо в браузере. Интерактивная реконструкция Лении Бёрта Чана: дневник наблюдений, живой атлас видов, первичный бульон. Понятно в любом возрасте.",
-  keywords: ["Ления", "Lenia", "клеточные автоматы", "Game of Life", "искусственная жизнь", "ALife", "WebGL", "аквариум"],
+    "Два живых мира: головастики, собирающиеся из хаоса, и грибы, делящиеся на колонию. Интерактивная реконструкция Лении Бёрта Чана. Понятно в любом возрасте.",
+  keywords: ["Ления", "Lenia", "клеточные автоматы", "Game of Life", "искусственная жизнь", "ALife", "WebGL"],
   authors: [{ name: "Z.ai" }],
   icons: {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
   },
   openGraph: {
-    title: "Ления — живой аквариум искусственной жизни",
-    description: "Существа рождаются, плавают и делятся по трём математическим правилам — прямо в вашем браузере",
+    title: "Пруд Лении — живая математика в браузере",
+    description: "Головастики рождаются из хаоса, грибы делятся — живой мир по трём правилам",
     siteName: "Z.ai",
     type: "website",
   },
@@ -41,7 +40,6 @@ export default function RootLayout({
         className={`${manrope.variable} ${jetbrainsMono.variable} antialiased bg-background text-foreground`}
       >
         {children}
-        <Toaster />
       </body>
     </html>
   );

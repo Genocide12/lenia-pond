@@ -297,9 +297,16 @@ export class LeniaEngine {
   private pal: Palette;
   private gamma = 0.75;
   private pixelBuf: Float32Array;
-  /** Scratch buffers for organism counting (connected components). */
+  /** Scratch buffers for organism counting (periodic connected components). */
   private visBuf!: Uint8Array;
   private stkBuf!: Int32Array;
+  private labelBuf!: Int32Array;
+  private parentBuf!: Int32Array;
+  private ccArea!: Int32Array;
+  private ccMass!: Float64Array;
+  private ccSx!: Float64Array;
+  private ccSy!: Float64Array;
+  private ccCap = 0;
   private uniformCache = new Map<WebGLProgram, Map<string, WebGLUniformLocation | null>>();
 
   constructor(canvas: HTMLCanvasElement, N: number, params: LeniaParams, pal: Palette) {
@@ -344,9 +351,11 @@ export class LeniaEngine {
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-    this.pixelBuf = new Float32Array(N * N * 4);
+    this.pixelBuf = new Float32Array(N * N);
     this.visBuf = new Uint8Array(N * N);
     this.stkBuf = new Int32Array(N * N);
+    this.labelBuf = new Int32Array(N * N);
+    this.parentBuf = new Int32Array(N * N);
     this.recalcNorm();
   }
 
@@ -546,9 +555,12 @@ export class LeniaEngine {
 
   /**
    * Масса, центроид, дисперсия и список организмов поля
-   * (текстурные координаты, y вверх). Полный readback. «Организм» — связная
-   * компонента выше 0.12 площадью 30–4000 клеток (те же критерии, что в
-   * эталонном NumPy-трекере).
+   * (текстурные координаты, y вверх). Полный readback (формат RED/FLOAT).
+   *
+   * «Организм» — связная компонента A > 0.1 площадью 30–8000 клеток.
+   * СВЯЗНОСТЬ ПЕРИОДИЧЕСКАЯ: существо, пересёкшее край тора, остаётся одним
+   * целым (края швов объединяются через union-find) — дневник не считает
+   * его дважды и не выдаёт ложных «рождений» на границе.
    */
   getStats(): {
     mass: number;
@@ -561,7 +573,7 @@ export class LeniaEngine {
     const gl = this.gl;
     const N = this.N;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[this.read]);
-    gl.readPixels(0, 0, N, N, gl.RGBA, gl.FLOAT, this.pixelBuf);
+    gl.readPixels(0, 0, N, N, gl.RED, gl.FLOAT, this.pixelBuf);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     let sum = 0;
     let sx = 0;
@@ -569,8 +581,9 @@ export class LeniaEngine {
     let s2 = 0;
     const buf = this.pixelBuf;
     for (let y = 0; y < N; y++) {
+      const row = y * N;
       for (let x = 0; x < N; x++) {
-        const a = buf[(y * N + x) * 4];
+        const a = buf[row + x];
         if (a > 0.02) {
           sum += a;
           sx += x * a;
@@ -579,51 +592,145 @@ export class LeniaEngine {
         }
       }
     }
-    // организмы: заливка по A > 0.12, с центроидом и массой каждой компоненты
-    const vis = this.visBuf;
-    const stk = this.stkBuf;
-    vis.fill(0);
-    const blobs: { x: number; y: number; mass: number; size: number }[] = [];
-    const total = N * N;
-    for (let i = 0; i < total; i++) {
-      if (vis[i] !== 0 || buf[i * 4] <= 0.12) continue;
-      let sp = 0;
-      stk[sp++] = i;
-      vis[i] = 1;
-      let size = 0;
-      let bsx = 0;
-      let bsy = 0;
-      let bmass = 0;
-      while (sp > 0) {
-        const p = stk[--sp];
-        size++;
-        const x = p % N;
-        const y = (p - x) / N;
-        const a = buf[p * 4];
-        bsx += x * a;
-        bsy += y * a;
-        bmass += a;
-        if (x > 0 && vis[p - 1] === 0 && buf[(p - 1) * 4] > 0.12) {
-          vis[p - 1] = 1;
-          stk[sp++] = p - 1;
-        }
-        if (x < N - 1 && vis[p + 1] === 0 && buf[(p + 1) * 4] > 0.12) {
-          vis[p + 1] = 1;
-          stk[sp++] = p + 1;
-        }
-        if (p >= N && vis[p - N] === 0 && buf[(p - N) * 4] > 0.12) {
-          vis[p - N] = 1;
-          stk[sp++] = p - N;
-        }
-        if (p < total - N && vis[p + N] === 0 && buf[(p + N) * 4] > 0.12) {
-          vis[p + N] = 1;
-          stk[sp++] = p + N;
-        }
+
+    // ---- проход 1: локальная разметка (запад, сз, север, св) ----
+    const lab = this.labelBuf;
+    const parent = this.parentBuf;
+    const THR = 0.1;
+    lab.fill(0);
+    let nl = 0;
+    const find = (a: number): number => {
+      let r = a;
+      while (parent[r] !== r) r = parent[r];
+      while (parent[a] !== r) {
+        const nx = parent[a];
+        parent[a] = r;
+        a = nx;
       }
-      if (size >= 30 && size <= 4000 && bmass > 0) {
-        blobs.push({ x: bsx / bmass, y: bsy / bmass, mass: bmass, size });
+      return r;
+    };
+    const union = (a: number, b: number) => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent[rb] = ra;
+    };
+    for (let y = 0; y < N; y++) {
+      const row = y * N;
+      for (let x = 0; x < N; x++) {
+        const i = row + x;
+        if (buf[i] <= THR) continue;
+        let l1 = 0;
+        let l2 = 0;
+        let l3 = 0;
+        let l4 = 0;
+        if (x > 0) l1 = lab[i - 1];
+        if (y > 0) {
+          const up = i - N;
+          l3 = lab[up];
+          if (x > 0) l2 = lab[up - 1];
+          if (x < N - 1) l4 = lab[up + 1];
+        }
+        let m = 0;
+        if (l1 > 0) m = find(l1);
+        if (l2 > 0) {
+          const r = find(l2);
+          if (m === 0 || r < m) {
+            if (m > 0) parent[m] = r;
+            m = r;
+          } else if (r !== m) parent[r] = m;
+        }
+        if (l3 > 0) {
+          const r = find(l3);
+          if (m === 0 || r < m) {
+            if (m > 0) parent[m] = r;
+            m = r;
+          } else if (r !== m) parent[r] = m;
+        }
+        if (l4 > 0) {
+          const r = find(l4);
+          if (m === 0 || r < m) {
+            if (m > 0) parent[m] = r;
+            m = r;
+          } else if (r !== m) parent[r] = m;
+        }
+        if (m === 0) {
+          nl++;
+          parent[nl] = nl;
+          lab[i] = nl;
+        } else {
+          lab[i] = m;
+        }
       }
     }
+
+    // ---- швы тора: объединяем метки, соприкасающиеся через край ----
+    // вертикальный шов: пиксель (0,y) соседствует с (N-1,y-1..y+1)
+    for (let y = 0; y < N; y++) {
+      const a = lab[y * N];
+      if (a === 0) continue;
+      const yu = (y + N - 1) % N;
+      const yd = (y + 1) % N;
+      const b = lab[y * N + N - 1];
+      const c = lab[yu * N + N - 1];
+      const d = lab[yd * N + N - 1];
+      if (b > 0) union(a, b);
+      if (c > 0) union(a, c);
+      if (d > 0) union(a, d);
+    }
+    // горизонтальный шов: пиксель (x,0) соседствует с (x-1..x+1,N-1)
+    for (let x = 0; x < N; x++) {
+      const a = lab[x];
+      if (a === 0) continue;
+      const xl = (x + N - 1) % N;
+      const xr = (x + 1) % N;
+      const b = lab[(N - 1) * N + x];
+      const c = lab[(N - 1) * N + xl];
+      const d = lab[(N - 1) * N + xr];
+      if (b > 0) union(a, b);
+      if (c > 0) union(a, c);
+      if (d > 0) union(a, d);
+    }
+
+    // ---- проход 2: накапливаем площадь/массу/центроид по корням ----
+    if (this.ccCap < nl + 1) {
+      this.ccCap = Math.max(1024, (nl + 1) * 2);
+      this.ccArea = new Int32Array(this.ccCap);
+      this.ccMass = new Float64Array(this.ccCap);
+      this.ccSx = new Float64Array(this.ccCap);
+      this.ccSy = new Float64Array(this.ccCap);
+    } else {
+      this.ccArea.fill(0, 0, nl + 1);
+      this.ccMass.fill(0, 0, nl + 1);
+      this.ccSx.fill(0, 0, nl + 1);
+      this.ccSy.fill(0, 0, nl + 1);
+    }
+    const area = this.ccArea;
+    const massArr = this.ccMass;
+    const sxA = this.ccSx;
+    const syA = this.ccSy;
+    for (let y = 0; y < N; y++) {
+      const row = y * N;
+      for (let x = 0; x < N; x++) {
+        const l = lab[row + x];
+        if (l === 0) continue;
+        const r = find(l);
+        const a = buf[row + x];
+        area[r]++;
+        massArr[r] += a;
+        sxA[r] += x * a;
+        syA[r] += y * a;
+      }
+    }
+    const blobs: { x: number; y: number; mass: number; size: number }[] = [];
+    for (let r = 1; r <= nl; r++) {
+      if (parent[r] !== r) continue;
+      const size = area[r];
+      const bm = massArr[r];
+      if (size >= 30 && size <= 8000 && bm > 0) {
+        blobs.push({ x: sxA[r] / bm, y: syA[r] / bm, mass: bm, size });
+      }
+    }
+    blobs.sort((p, q) => q.mass - p.mass);
     if (sum <= 0) return { mass: 0, cx: 0, cy: 0, mom2: 0, population: blobs.length, blobs };
     const cx = sx / sum;
     const cy = sy / sum;
@@ -631,11 +738,11 @@ export class LeniaEngine {
     return { mass: sum, cx, cy, mom2, population: blobs.length, blobs };
   }
 
-  /** Прочитать текущее состояние (RGBA FLOAT, текстурные координаты) в буфер. */
+  /** Прочитать текущее состояние (RED FLOAT, текстурные координаты) в буфер. */
   readStateInto(buf: Float32Array) {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[this.read]);
-    gl.readPixels(0, 0, this.N, this.N, gl.RGBA, gl.FLOAT, buf);
+    gl.readPixels(0, 0, this.N, this.N, gl.RED, gl.FLOAT, buf);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 

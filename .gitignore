@@ -10,3 +10,4 @@ scripts/*.png
 scripts/shot*.png
 db/
 .env*
+tsconfig.tsbuildinfo
