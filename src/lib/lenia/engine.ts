@@ -274,7 +274,8 @@ void main() {
   if (textured) {
     float v = field(sc * 96, f);
     float sh = v * v * (3.0 - 2.0 * v); // органичная пластика вместо пикселей
-    col = max(water, sp >= 0 ? palette(sp, pow(sh, uGamma)) : vec3(0.0));
+    float vis = smoothstep(0.02, 0.12, v); // пустая вода не заливается цветом палитры
+    col = sp >= 0 ? mix(water, palette(sp, pow(sh, uGamma)), vis) : water;
   } else {
     col = water;
     if (sp >= 0) {

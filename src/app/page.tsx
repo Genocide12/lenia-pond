@@ -109,11 +109,14 @@ export default function Page() {
   const actionsRef = useRef({ populate: () => {}, clear: () => {}, overview: () => {} });
 
   const [error, setError] = useState<string | null>(null);
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false); // до нажатия «Начать эволюцию» мир ждёт
+  const [started, setStarted] = useState(false);
   const [speedIdx, setSpeedIdx] = useState(1);
   const [sel, setSel] = useState(0);
   const [climateOpen, setClimateOpen] = useState(false);
   const [installReady, setInstallReady] = useState(false);
+  const startedRef = useRef(false);
+  const pauseParamRef = useRef(false);
 
   useEffect(() => {
     runningRef.current = running;
@@ -273,6 +276,7 @@ export default function Page() {
     /* ---- старт: жизнь у начала координат ---- */
 
     const q = new URLSearchParams(window.location.search);
+    pauseParamRef.current = q.has('pause');
     for (let dy = -2; dy <= 2; dy++) {
       for (let dx = -2; dx <= 2; dx++) {
         if (Math.random() < 0.75) world.seedDish(dx, dy, Math.floor(Math.random() * SPECIES.length), 3 + Math.random() * 6);
@@ -284,10 +288,6 @@ export default function Page() {
     cam0.x = 0.5;
     cam0.y = 0.5;
     cam0.scale = q.get('zoom') === 'fit' ? minScale() : (Math.min(sizeRef.current.w, sizeRef.current.h) || 900) / 3.6;
-    if (q.has('pause')) {
-      runningRef.current = false;
-      queueMicrotask(() => setRunning(false));
-    }
     const sp0 = q.get('speed');
     if (sp0 && SPEEDS.includes(parseFloat(sp0))) {
       const idx = SPEEDS.indexOf(parseFloat(sp0));
@@ -482,6 +482,7 @@ export default function Page() {
 
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement) return;
+      if (!startedRef.current) return; // стартовый экран — модальный
       switch (e.code) {
         case 'Space':
           e.preventDefault();
@@ -790,7 +791,7 @@ export default function Page() {
         if (now - lastEco >= ECO_MS) {
           lastEco = now;
           world.setCamera(cdx, cdy);
-          world.tick(0.5 * speedRef.current, hooks);
+          if (runningRef.current) world.tick(0.5 * speedRef.current, hooks); // на паузе планета замерла
           engine.setMeta(world.buildMeta(metaOrgRef.current));
         }
         if (now - lastStats >= STATS_MS) {
@@ -917,16 +918,59 @@ export default function Page() {
 
   const speedLabel = SPEEDS[speedIdx] === 0.5 ? '×½' : `×${SPEEDS[speedIdx]}`;
 
+  const startEvolution = () => {
+    startedRef.current = true;
+    setStarted(true);
+    if (!pauseParamRef.current) setRunning(true);
+  };
+
   return (
     <div className="fixed inset-0 overflow-hidden bg-[#040806] text-neutral-100" style={{ touchAction: 'none' }}>
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full touch-none select-none" aria-label="Пруд Лении" />
       <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden />
 
       {error && (
-        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 p-6">
-          <div className="max-w-md rounded-xl border border-rose-500/40 bg-rose-950/20 p-5 text-center">
-            <p className="font-medium text-rose-300">Симуляция остановлена</p>
-            <p className="mt-1 text-sm text-neutral-400">{error}</p>
+        <div
+          className="pointer-events-none absolute inset-x-0 z-50 flex justify-center px-3"
+          style={{ top: 'max(5.5rem, calc(env(safe-area-inset-top) + 5.5rem))' }}
+        >
+          <div className="pointer-events-auto w-full max-w-sm rounded-2xl border border-rose-500/40 bg-rose-950/85 p-4 shadow-xl backdrop-blur">
+            <p className="text-sm font-semibold text-rose-300">Симуляция остановилась</p>
+            <p className="mt-1 break-words text-xs leading-relaxed text-neutral-400">{error}</p>
+            <button
+              onClick={() => window.location.reload()}
+              className="mt-3 h-10 w-full rounded-xl border border-rose-400/40 bg-rose-900/40 text-sm font-medium text-rose-100 transition-transform active:scale-95"
+            >
+              Перезапустить
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!started && !error && (
+        <div
+          data-testid="start-screen"
+          className="absolute inset-0 z-40 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+        >
+          <div className="w-full max-w-sm rounded-3xl border border-emerald-500/25 bg-[#06110d]/92 p-6 shadow-2xl">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-emerald-400/80">клеточный автомат · Lenia</p>
+            <h1 className="mt-1.5 text-3xl font-extrabold tracking-tight text-neutral-50">Пруд Лении</h1>
+            <p className="mt-2 text-sm leading-relaxed text-neutral-400">
+              Планета из бесконечных блюдцев. Существа ползут, делятся, мутируют, болеют вирусами и вымирают. Планета живёт своей жизнью — можно вмешаться.
+            </p>
+            <button
+              onClick={startEvolution}
+              data-testid="start"
+              className="mt-5 flex h-14 w-full items-center justify-center gap-2.5 rounded-2xl bg-emerald-500 text-base font-bold text-emerald-950 shadow-lg shadow-emerald-500/25 transition-transform active:scale-95"
+            >
+              <Play className="h-5 w-5 fill-current" />
+              Начать эволюцию
+            </button>
+            <div className="mt-4 space-y-1 text-[11px] leading-relaxed text-neutral-500">
+              <p>Тап — к блюдцу · двойной тап — зум · щипок или колесо — масштаб</p>
+              <p>Выбери существо внизу и тапни по блюдцу — поселить</p>
+              <p>Вирусы, мутации и вымирания случаются сами — смотри ленту событий</p>
+            </div>
           </div>
         </div>
       )}
