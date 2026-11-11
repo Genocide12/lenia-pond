@@ -30,6 +30,13 @@ export const LOD_CELL = DISH / LOD_N; // клеток, усредняемых в
 export const LOD_LO = 32; // px на блюдце: ниже — чистый LOD-рендер
 export const LOD_HI = 64; // px на блюдце: выше — честная выборка клеток
 
+/* ---------- инстансинг шагов ---------- */
+
+const RMAX = Math.max(...POND_LIST.map((c) => c.R)); // самый большой радиус ядра
+const KCELL = 2 * RMAX + 1; // клетка вида в атласе ядер
+const KERNEL_COLS = 4; // видов в строке атласа
+const MAX_INST = 2048; // экземпляров на один проход шага
+
 /** Палитры не нужны: цвет вида считается в шейдере из его id (hue),
  *  поэтому новых видов может быть много — до 62, и все различимы. */
 
@@ -97,42 +104,78 @@ layout(location=0) in vec2 aPos;
 void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
 
 /** Шаг Lenia внутри блюдца со стенами: за границей — пустота (нули),
- *  поэтому существа чувствуют стену и не пересекают её. */
-const STEP_FRAG = `#version 300 es
+ *  поэтому существа чувствуют стену и не пересекают её.
+ *  ИНСТАНСИРОВАННЫЙ: сотни блюдцев шагают за один draw call — вместо
+ *  пары вызовов на каждое блюдце-шаг. Данные экземпляра — текстура uInst
+ *  (3 строки RGBA32F): строка 0 — ox, oy, R, индекс ядра; строка 1 — m, s,
+ *  dt, norm; строка 2 — gn. Вершинный шейдер сам размещает квад слота
+ *  в атласе, viewport один на всех. */
+const VERT_INST = `#version 300 es
+layout(location=0) in vec2 aPos;
+uniform sampler2D uInst;
+uniform float uAW;
+out vec2 vOrigin;
+flat out int vInst;
+void main() {
+  vInst = gl_InstanceID;
+  vec4 d = texelFetch(uInst, ivec2(gl_InstanceID, 0), 0);
+  vOrigin = d.xy;
+  vec2 px = d.xy + (aPos * 0.5 + 0.5) * float(${DISH});
+  gl_Position = vec4(px / uAW * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const STEP_INST_FRAG = `#version 300 es
 precision highp float;
 precision highp int;
 uniform sampler2D uState;
-uniform sampler2D uKernel; // (2R+1)² весов — вместо ALU-ядра в цикле
-uniform ivec2 uOrigin;
-uniform int uR, uGn;
-uniform float uMu, uSigma, uDt, uNorm;
+uniform sampler2D uKernels; // атлас ядер: клетка KCELL×KCELL на вид
+uniform sampler2D uInst;
+in vec2 vOrigin;
+flat in int vInst;
 out vec4 frag;
-
-float growth(float u) {
-  float x = u - uMu;
-  if (uGn == 1) { float t = max(0.0, 1.0 - (x * x) / (9.0 * uSigma * uSigma)); return t * t * t * t * 2.0 - 1.0; }
-  if (uGn == 3) { return (abs(x) <= uSigma) ? 1.0 : -1.0; }
-  return exp(-(x * x) / (2.0 * uSigma * uSigma)) * 2.0 - 1.0;
+float growth(float u, float mu, float sigma, int gn) {
+  float x = u - mu;
+  if (gn == 1) { float t = max(0.0, 1.0 - (x * x) / (9.0 * sigma * sigma)); return t * t * t * t * 2.0 - 1.0; }
+  if (gn == 3) { return (abs(x) <= sigma) ? 1.0 : -1.0; }
+  return exp(-(x * x) / (2.0 * sigma * sigma)) * 2.0 - 1.0;
 }
 void main() {
-  ivec2 lc = ivec2(gl_FragCoord.xy) - uOrigin;
+  int inst = vInst;
+  vec4 d0 = texelFetch(uInst, ivec2(inst, 0), 0);
+  vec4 d1 = texelFetch(uInst, ivec2(inst, 1), 0);
+  vec4 d2 = texelFetch(uInst, ivec2(inst, 2), 0);
+  int R = int(d0.z + 0.5);
+  int kIdx = int(d0.w + 0.5);
+  float mu = d1.x, sigma = d1.y, dt = d1.z, norm = d1.w;
+  int gn = int(d2.x + 0.5);
+  ivec2 lc = ivec2(gl_FragCoord.xy) - ivec2(vOrigin);
+  ivec2 korg = ivec2((kIdx % ${KERNEL_COLS}) * ${KCELL}, (kIdx / ${KERNEL_COLS}) * ${KCELL});
   float u = 0.0;
-  for (int dy = -uR; dy <= uR; dy++) {
-    for (int dx = -uR; dx <= uR; dx++) {
-      float k = texelFetch(uKernel, ivec2(dx + uR, dy + uR), 0).r;
+  for (int dy = -R; dy <= R; dy++) {
+    for (int dx = -R; dx <= R; dx++) {
+      float k = texelFetch(uKernels, korg + ivec2(dx + ${RMAX}, dy + ${RMAX}), 0).r;
       if (k != 0.0) {
         int qx = lc.x + dx;
         int qy = lc.y + dy;
         if (qx >= 0 && qx < ${DISH} && qy >= 0 && qy < ${DISH}) {
-          u += k * texelFetch(uState, uOrigin + ivec2(qx, qy), 0).r;
+          u += k * texelFetch(uState, ivec2(vOrigin) + ivec2(qx, qy), 0).r;
         }
       }
     }
   }
-  u /= uNorm;
-  float a = texelFetch(uState, uOrigin + lc, 0).r;
-  frag = vec4(clamp(a + uDt * growth(u), 0.0, 1.0), 0.0, 0.0, 1.0);
+  u /= norm;
+  float a = texelFetch(uState, ivec2(gl_FragCoord.xy), 0).r;
+  frag = vec4(clamp(a + dt * growth(u, mu, sigma, gn), 0.0, 1.0), 0.0, 0.0, 1.0);
 }`;
+
+/** Копирование шагов назад в атлас-источник — тоже инстансированное. */
+const COPY_INST_FRAG = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uSrc;
+in vec2 vOrigin;
+out vec4 frag;
+void main() { frag = texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0); }`;
 
 /** Возмущения экосистемы: мор (0), вирус (1) и угасание (2 — умножение
  *  на uK: болезни гасят колонию постепенно, тик за тиком). */
@@ -318,7 +361,7 @@ void main() {
   vec2 px = gl_FragCoord.xy;
   vec2 w = uCam + (px - uRes * 0.5) / uScale;
   vec2 q = px / uRes - vec2(0.5);
-  vec3 bg = vec3(0.005, 0.011, 0.010) * (1.0 - 0.4 * dot(q, q));
+  vec3 bg = vec3(0.005, 0.011, 0.010);
 
   // вне конечной планеты — тёмная бездна с мягким ореолом края мира
   vec2 dout = max(vec2(0.0) - w, w - vec2(float(${WORLD})));
@@ -348,6 +391,8 @@ void main() {
   // вода блюдца: вблизи — своя у каждого, вдали — глубокая гладь
   vec3 water = mix(vec3(0.014, 0.040, 0.044), vec3(0.043, 0.031, 0.013), h1) * (0.72 + 0.56 * h1);
   water = mix(vec3(0.010, 0.028, 0.032), water, smoothstep(0.6, 2.5, uScale));
+  // тихий блеск воды — еле заметное течение
+  water += vec3(0.004, 0.011, 0.013) * vnoise(f * 6.0 + vec2(uTime * 0.04, -uTime * 0.03)) * smoothstep(3.0, 24.0, uScale);
 
   vec3 col;
   if (slot >= 0 && sp >= 0) {
@@ -366,6 +411,12 @@ void main() {
     float sh = v * v * (3.0 - 2.0 * v);
     float vis = smoothstep(0.015, 0.11, v);
     col = mix(water, speciesColor(sp, pow(sh, uGamma)), vis);
+    if (uScale >= float(LOD_HI)) {
+      // мягкий ореол жизни вокруг колоний — свечение без отдельного прохода
+      vec2 off = vec2(2.0) / float(${DISH});
+      float g = field(so, f + off) + field(so, f - off) + field(so, f + vec2(off.x, -off.y)) + field(so, f + vec2(-off.x, off.y));
+      col += speciesColor(sp, 0.30) * min(g * 0.10, 0.30);
+    }
   } else if (sp >= 0) {
     // статистическое блюдце: цвет вида × уровень жизни, тихий ползущий шум
     vec3 sc = speciesColor(sp, 0.80);
@@ -414,6 +465,10 @@ void main() {
     float pulse = 0.5 + 0.3 * tri(uTime * 1.2);
     col = mix(col, vec3(0.16, 0.85, 0.55), glow * pulse);
   }
+  // виньетка и мягкая тональная кривая — «киношный» вид пруда
+  col *= 1.0 - 0.32 * dot(q, q);
+  col = col / (col * 0.45 + 0.80);
+  col = pow(max(col, vec3(0.0)), vec3(0.94));
   frag = vec4(col, 1.0);
 }`;
 
@@ -440,9 +495,9 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLSh
   return sh;
 }
 
-function program(gl: WebGL2RenderingContext, fragSrc: string): WebGLProgram {
+function program(gl: WebGL2RenderingContext, fragSrc: string, vertSrc = VERT): WebGLProgram {
   const p = gl.createProgram()!;
-  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, VERT));
+  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vertSrc));
   gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fragSrc));
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('Link: ' + gl.getProgramInfoLog(p));
@@ -461,13 +516,16 @@ export class PondEngine {
   private fbo: WebGLFramebuffer[] = [];
   private metaTex!: WebGLTexture;
   private metaDirty = false;
-  private kernelTex: WebGLTexture[] = [];
+  private kernelAtlas!: WebGLTexture;
+  private instTex!: WebGLTexture;
+  private instStage = new Float32Array(MAX_INST * 12);
   private lodTex!: WebGLTexture;
   private lodFbo!: WebGLFramebuffer;
   private lodBuf: Float32Array;
   private scratchTex!: WebGLTexture;
   private scratchFbo!: WebGLFramebuffer;
-  private progStep: WebGLProgram;
+  private progStepInst: WebGLProgram;
+  private progCopyInst: WebGLProgram;
   private progPerturb: WebGLProgram;
   private progLod: WebGLProgram;
   private progCopy: WebGLProgram;
@@ -486,6 +544,20 @@ export class PondEngine {
   private ccMass!: Float64Array;
   private ccSx!: Float64Array;
   private ccSy!: Float64Array;
+  // асинхронные чтения (PBO): без остановки конвейера GPU
+  private lodPbo: WebGLBuffer[] = [];
+  private lodFence: (WebGLSync | null)[] = [];
+  private lodPend = [false, false];
+  private lodIdx = 0;
+  private statPbo: WebGLBuffer = null as unknown as WebGLBuffer;
+  private statFence: WebGLSync | null = null;
+  private statSlot = -1;
+  // кэш поворотов существ: без аллокаций при посадках
+  private rotCache: { w: number; h: number; cells: Float32Array }[][] = [];
+  private rotFlip: Float32Array[][] = [];
+  private lastMipMs = -1e9;
+  private singleItem: StepParams & { slot: number } = { slot: 0, sp: 0, m: 0.15, s: 0.015, T: 10 };
+  private rev = 0; // версия состояния (менялся ли атлас — для LOD)
 
   constructor(canvas: HTMLCanvasElement) {
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
@@ -509,6 +581,23 @@ export class PondEngine {
     this.speciesList = POND_LIST;
     this.norms = this.speciesList.map((c) => kernelNorm(c.R, c.b, c.kn));
 
+    // кэш поворотов существ (4 ориентации на вид) — посадки без аллокаций
+    this.speciesList.forEach((c, i) => {
+      const rots: { w: number; h: number; cells: Float32Array }[] = [];
+      const flips: Float32Array[] = [];
+      for (let r = 0; r < 4; r++) {
+        const rc = rotateCells(c.cells, c.w, c.h, r);
+        rots.push({ w: rc.w, h: rc.h, cells: Float32Array.from(rc.cells) });
+        const f = new Float32Array(rc.w * rc.h);
+        for (let j = 0; j < rc.h; j++) {
+          for (let x = 0; x < rc.w; x++) f[(rc.h - 1 - j) * rc.w + x] = rc.cells[j * rc.w + x];
+        }
+        flips.push(f);
+      }
+      this.rotCache.push(rots);
+      this.rotFlip.push(flips);
+    });
+
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
     const buf = gl.createBuffer();
@@ -518,14 +607,25 @@ export class PondEngine {
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
     const SD = String(this.slotSide);
-    this.progStep = program(gl, STEP_FRAG);
+    const AW = this.slotSide * DISH;
+    this.progStepInst = program(gl, STEP_INST_FRAG, VERT_INST);
+    this.progCopyInst = program(gl, COPY_INST_FRAG, VERT_INST);
     this.progPerturb = program(gl, PERTURB_FRAG);
     this.progLod = program(gl, LOD_FRAG);
     this.progCopy = program(gl, COPY_FRAG);
     this.progStamp = program(gl, STAMP_FRAG);
     this.progRender = program(gl, RENDER_FRAG.replaceAll('__SD__', SD));
+    gl.useProgram(this.progStepInst);
+    gl.uniform1f(this.uni(this.progStepInst, 'uAW'), AW);
+    gl.uniform1i(this.uni(this.progStepInst, 'uState'), 0);
+    gl.uniform1i(this.uni(this.progStepInst, 'uKernels'), 1);
+    gl.uniform1i(this.uni(this.progStepInst, 'uInst'), 2);
+    gl.useProgram(this.progCopyInst);
+    gl.uniform1f(this.uni(this.progCopyInst, 'uAW'), AW);
+    gl.uniform1i(this.uni(this.progCopyInst, 'uSrc'), 0);
+    gl.uniform1i(this.uni(this.progCopyInst, 'uInst'), 2);
+    gl.useProgram(null);
 
-    const AW = this.slotSide * DISH;
     for (let i = 0; i < 2; i++) {
       const t = gl.createTexture()!;
       gl.bindTexture(gl.TEXTURE_2D, t);
@@ -544,22 +644,48 @@ export class PondEngine {
       this.fbo.push(f);
     }
 
-    // текстуры ядер видов: вес ядра вместо ALU в самом горячем цикле
-    this.speciesList.forEach((c) => {
-      const D = 2 * c.R + 1;
-      const k = new Float32Array(D * D);
-      for (let dy = -c.R; dy <= c.R; dy++) {
-        for (let dx = -c.R; dx <= c.R; dx++) k[(dy + c.R) * D + (dx + c.R)] = kernelAt(Math.hypot(dx, dy) / c.R, c.b, c.kn);
+    // атлас ядер всех видов: клетка KCELL×KCELL на вид, вес ядра вместо ALU
+    this.kernelAtlas = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.kernelAtlas);
+    const kRows = Math.ceil(this.speciesList.length / KERNEL_COLS);
+    const kat = new Float32Array(KERNEL_COLS * kRows * KCELL * KCELL);
+    this.speciesList.forEach((c, i) => {
+      const cx = (i % KERNEL_COLS) * KCELL;
+      const cy = ((i / KERNEL_COLS) | 0) * KCELL;
+      const rowStride = KERNEL_COLS * KCELL;
+      for (let dy = -RMAX; dy <= RMAX; dy++) {
+        for (let dx = -RMAX; dx <= RMAX; dx++) {
+          kat[(cy + dy + RMAX) * rowStride + cx + dx + RMAX] = kernelAt(Math.hypot(dx, dy) / c.R, c.b, c.kn);
+        }
       }
-      const t = gl.createTexture()!;
-      gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, D, D, 0, gl.RED, gl.FLOAT, k);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      this.kernelTex.push(t);
     });
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, KERNEL_COLS * KCELL, kRows * KCELL, 0, gl.RED, gl.FLOAT, kat);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    // данные экземпляров инстансированного шага (перезаписываются — без утечек)
+    this.instTex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.instTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_INST, 3, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    // PBO для асинхронных чтений (кольцо из двух буферов — без аллокаций)
+    for (let i = 0; i < 2; i++) {
+      const b = gl.createBuffer()!;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, this.lodBuf.byteLength, gl.STREAM_READ);
+      this.lodPbo.push(b);
+      this.lodFence.push(null);
+    }
+    this.statPbo = gl.createBuffer()!;
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statPbo);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, this.pixelBuf.byteLength, gl.STREAM_READ);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
 
     // мета-текстура планеты: тексель = блюдце, мипы для дальнего плана
     this.metaTex = gl.createTexture()!;
@@ -631,28 +757,36 @@ export class PondEngine {
     this.metaDirty = false;
   }
 
-  /** Перестроить мип-уровни мета-текстуры (после загрузок строк). */
+  /** Перестроить мип-уровни мета-текстуры; не чаще ~7 раз в секунду —
+   *  generateMipmap на 2048² дорог, а вдали запаздывание незаметно. */
   regenMetaMips() {
     if (!this.metaDirty) return;
+    const now = performance.now();
+    if (now - this.lastMipMs < 140) return;
+    this.lastMipMs = now;
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.metaTex);
     gl.generateMipmap(gl.TEXTURE_2D);
     this.metaDirty = false;
   }
 
+  /** Менялся ли атлас жизни с прошлого LOD (шаги, посадки, болезни). */
+  get stateRevision(): number {
+    return this.rev;
+  }
+
   /** Посадить существо в слот (центр — lx, ly в клетках, y вверх).
    *  Тело всегда целиком внутри блюдца: стены не пересекаются.
-   *  Перезапись — для посева пустых блюдцев. */
+   *  Перезапись — для посева пустых блюдцев. Аллокаций нет: повороты
+   *  существ закэшированы при создании движка. */
   place(slot: number, spIdx: number, rot: number, lx: number, ly: number) {
     const c = this.speciesList[spIdx];
     if (!c) return;
-    const rc = rotateCells(c.cells, c.w, c.h, rot);
+    const rt = ((rot % 4) + 4) % 4;
+    const rc = this.rotCache[spIdx][rt];
+    const src = this.rotFlip[spIdx][rt];
     const gl = this.gl;
     const D = DISH;
-    const src = new Float32Array(rc.w * rc.h);
-    for (let j = 0; j < rc.h; j++) {
-      for (let x = 0; x < rc.w; x++) src[(rc.h - 1 - j) * rc.w + x] = rc.cells[j * rc.w + x];
-    }
     const maxX = Math.max(1, D - 1 - rc.w);
     const maxY = Math.max(1, D - 1 - rc.h);
     const px = Math.min(maxX, Math.max(1, Math.round(lx - rc.w / 2)));
@@ -661,6 +795,7 @@ export class PondEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, ox + px, oy + py, rc.w, rc.h, gl.RED, gl.FLOAT, src);
+    this.rev++;
   }
 
   /** Посадить существо аддитивно (max): вливается в живую колонию,
@@ -668,7 +803,7 @@ export class PondEngine {
   placeAdd(slot: number, spIdx: number, rot: number, lx: number, ly: number) {
     const c = this.speciesList[spIdx];
     if (!c) return;
-    const rc = rotateCells(c.cells, c.w, c.h, rot);
+    const rc = this.rotCache[spIdx][((rot % 4) + 4) % 4];
     const gl = this.gl;
     const D = DISH;
     const stamp = this.stampBuf;
@@ -680,10 +815,11 @@ export class PondEngine {
     for (let j = 0; j < rc.h; j++) {
       const ty = py + rc.h - 1 - j; // y вверх: строка 0 существа — верхняя
       if (ty < 0 || ty >= D) continue;
+      const srcRow = j * rc.w;
       for (let x = 0; x < rc.w; x++) {
         const tx = px + x;
         if (tx < 0 || tx >= D) continue;
-        stamp[ty * D + tx] = rc.cells[j * rc.w + x];
+        stamp[ty * D + tx] = rc.cells[srcRow + x];
       }
     }
     const [ox, oy] = this.slotOrigin(slot);
@@ -712,6 +848,7 @@ export class PondEngine {
     gl.viewport(ox, oy, D, D);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.rev++;
   }
 
   /** Очистить слот. */
@@ -721,6 +858,7 @@ export class PondEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, ox, oy, DISH, DISH, gl.RED, gl.FLOAT, this.zeroTile);
+    this.rev++;
   }
 
   /** Очистить весь атлас разом (кнопка «Очистить» — вся планета). */
@@ -765,40 +903,71 @@ export class PondEngine {
     }
   }
 
+  /** Пакет шагов Lenia: все блюдца за ОДИН инстансированный проход
+   *  (плюс один проход копирования назад) — вместо пары draw call
+   *  на каждое блюдце-шаг. items — переиспользуемый пул, count — сколько занято. */
+  stepBatch(items: (StepParams & { slot: number })[], count: number) {
+    const gl = this.gl;
+    const AW = this.slotSide * DISH;
+    let done = 0;
+    while (done < count) {
+      const n = Math.min(count - done, MAX_INST);
+      const st = this.instStage;
+      for (let i = 0; i < n; i++) {
+        const it = items[done + i];
+        const c = this.speciesList[it.sp];
+        if (!c) continue;
+        const o0 = i * 4;
+        const o1 = n * 4 + i * 4;
+        const o2 = n * 8 + i * 4;
+        st[o0] = (it.slot % this.slotSide) * DISH;
+        st[o0 + 1] = ((it.slot / this.slotSide) | 0) * DISH;
+        st[o0 + 2] = c.R;
+        st[o0 + 3] = it.sp;
+        st[o1] = it.m;
+        st[o1 + 1] = it.s;
+        st[o1 + 2] = 1 / it.T;
+        st[o1 + 3] = this.norms[it.sp];
+        st[o2] = c.gn;
+        st[o2 + 1] = 0;
+        st[o2 + 2] = 0;
+        st[o2 + 3] = 0;
+      }
+      gl.bindTexture(gl.TEXTURE_2D, this.instTex);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, n, 3, gl.RGBA, gl.FLOAT, st);
+
+      gl.useProgram(this.progStepInst);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.kernelAtlas);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, this.instTex);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[1]);
+      gl.viewport(0, 0, AW, AW);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+
+      gl.useProgram(this.progCopyInst);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.tex[1]);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[0]);
+      gl.viewport(0, 0, AW, AW);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+      done += n;
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.rev++;
+  }
+
   /** Один шаг Lenia для слота с явными параметрами (вид+мутации). */
   stepSlot(slot: number, p: StepParams) {
-    const c = this.speciesList[p.sp];
-    if (!c) return;
-    const gl = this.gl;
-    const [ox, oy] = this.slotOrigin(slot);
-
-    gl.useProgram(this.progStep);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
-    gl.uniform1i(this.uni(this.progStep, 'uState'), 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.kernelTex[p.sp]);
-    gl.uniform1i(this.uni(this.progStep, 'uKernel'), 1);
-    gl.uniform2i(this.uni(this.progStep, 'uOrigin'), ox, oy);
-    gl.uniform1i(this.uni(this.progStep, 'uR'), c.R);
-    gl.uniform1f(this.uni(this.progStep, 'uMu'), p.m);
-    gl.uniform1f(this.uni(this.progStep, 'uSigma'), p.s);
-    gl.uniform1f(this.uni(this.progStep, 'uDt'), 1 / p.T);
-    gl.uniform1f(this.uni(this.progStep, 'uNorm'), this.norms[p.sp]);
-    gl.uniform1i(this.uni(this.progStep, 'uGn'), c.gn);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[1]);
-    gl.viewport(ox, oy, DISH, DISH);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-    gl.useProgram(this.progCopy);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex[1]);
-    gl.uniform1i(this.uni(this.progCopy, 'uSrc'), 0);
-    gl.uniform2i(this.uni(this.progCopy, 'uOffset'), 0, 0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[0]);
-    gl.viewport(ox, oy, DISH, DISH);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const it = this.singleItem;
+    it.slot = slot;
+    it.sp = p.sp;
+    it.m = p.m;
+    it.s = p.s;
+    it.T = p.T;
+    this.stepBatch([it], 1);
   }
 
   /** Возмущение слота: 0 — мор, 1 — вирус, 2 — угасание (умножение на k). */
@@ -841,13 +1010,39 @@ export class PondEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  /** Прочитать LOD-текстуру — один readPixels. */
-  readLod(): Float32Array {
+  /** Заказать асинхронное чтение LOD-текстуры (PBO — без остановки GPU). */
+  requestLod() {
     const gl = this.gl;
+    if (this.lodPend[this.lodIdx]) return;
+    const i = this.lodIdx;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.lodFbo);
-    gl.readPixels(0, 0, this.lodTexSide, this.lodTexSide, gl.RED, gl.FLOAT, this.lodBuf);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.lodPbo[i]);
+    gl.readPixels(0, 0, this.lodTexSide, this.lodTexSide, gl.RED, gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return this.lodBuf;
+    this.lodFence[i] = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    this.lodPend[i] = true;
+    this.lodIdx = 1 - i;
+  }
+
+  /** Забрать готовое чтение LOD (null — ещё считает GPU). */
+  pollLod(): Float32Array | null {
+    const gl = this.gl;
+    for (let k = 1; k >= 0; k--) {
+      const i = (this.lodIdx + k) % 2; // старейший заказ — первым
+      if (!this.lodPend[i] || !this.lodFence[i]) continue;
+      const st = gl.clientWaitSync(this.lodFence[i]!, 0, 0);
+      if (st === gl.TIMEOUT_EXPIRED) continue;
+      gl.deleteSync(this.lodFence[i]!);
+      this.lodFence[i] = null;
+      this.lodPend[i] = false;
+      if (st === gl.WAIT_FAILED) continue;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.lodPbo[i]);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, this.lodBuf);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      return this.lodBuf;
+    }
+    return null;
   }
 
   /** Прочитать слот в скретч (для полного анализа). */
@@ -869,6 +1064,55 @@ export class PondEngine {
   /** Масса и организмы слота: связность без перехода стен (блюдце не тор). */
   stats(slot: number): PondStats {
     this.readSlot(slot, this.pixelBuf);
+    return this.analyzeSlot();
+  }
+
+  /** Заказать асинхронный анализ слота — для постоянного наблюдения
+   *  за блюдцем в фокусе (без синхронных readPixels в кадре). */
+  requestStats(slot: number) {
+    if (this.statSlot >= 0) return;
+    const gl = this.gl;
+    const [ox, oy] = this.slotOrigin(slot);
+    gl.useProgram(this.progCopy);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
+    gl.uniform1i(this.uni(this.progCopy, 'uSrc'), 0);
+    gl.uniform2i(this.uni(this.progCopy, 'uOffset'), ox, oy);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+    gl.viewport(0, 0, DISH, DISH);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statPbo);
+    gl.readPixels(0, 0, DISH, DISH, gl.RED, gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.statFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    this.statSlot = slot;
+  }
+
+  /** Забрать готовый анализ (null — GPU ещё считает или заказа не было). */
+  pollStats(): { slot: number; stats: PondStats } | null {
+    if (this.statSlot < 0) return null;
+    const gl = this.gl;
+    if (this.statFence) {
+      const st = gl.clientWaitSync(this.statFence, 0, 0);
+      if (st === gl.TIMEOUT_EXPIRED) return null;
+      gl.deleteSync(this.statFence);
+      this.statFence = null;
+      if (st === gl.WAIT_FAILED) {
+        this.statSlot = -1;
+        return null;
+      }
+    }
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statPbo);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, this.pixelBuf);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const res = { slot: this.statSlot, stats: this.analyzeSlot() };
+    this.statSlot = -1;
+    return res;
+  }
+
+  /** Анализ пикселей pixelBuf: масса + организмы (union-find). */
+  private analyzeSlot(): PondStats {
     const buf = this.pixelBuf;
     const N = DISH;
     let sum = 0;
@@ -1011,14 +1255,20 @@ export class PondEngine {
     const gl = this.gl;
     for (const f of this.fbo) gl.deleteFramebuffer(f);
     for (const t of this.tex) gl.deleteTexture(t);
-    for (const t of this.kernelTex) gl.deleteTexture(t);
+    gl.deleteTexture(this.kernelAtlas);
+    gl.deleteTexture(this.instTex);
     gl.deleteTexture(this.metaTex);
     gl.deleteTexture(this.lodTex);
     gl.deleteFramebuffer(this.lodFbo);
     gl.deleteTexture(this.scratchTex);
     gl.deleteTexture(this.stampTex);
     gl.deleteFramebuffer(this.scratchFbo);
-    gl.deleteProgram(this.progStep);
+    for (const b of this.lodPbo) gl.deleteBuffer(b);
+    for (const f of this.lodFence) if (f) gl.deleteSync(f);
+    gl.deleteBuffer(this.statPbo);
+    if (this.statFence) gl.deleteSync(this.statFence);
+    gl.deleteProgram(this.progStepInst);
+    gl.deleteProgram(this.progCopyInst);
     gl.deleteProgram(this.progPerturb);
     gl.deleteProgram(this.progLod);
     gl.deleteProgram(this.progCopy);

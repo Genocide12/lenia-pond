@@ -161,6 +161,7 @@ export class Biosphere {
   private suffixIdx = 0;
   private speciesFree: number[] = [];
   private nextSpeciateAt = 0; // кулдаун видообразования: новый вид успевает расплодиться
+  private iter: EcoRec[] = []; // переиспользуемый снимок для тиков — без аллокаций
 
   constructor() {
     this.reset();
@@ -299,6 +300,16 @@ export class Biosphere {
     return { sp: s.base, m: s.m, s: s.s, T: s.T };
   }
 
+  /** То же без аллокации — в переиспользуемый объект (горячий путь кадра). */
+  dishParamsInto(r: EcoRec, out: { sp: number; m: number; s: number; T: number }) {
+    const s = this.species[r.sp];
+    if (!s) return;
+    out.sp = s.base;
+    out.m = s.m;
+    out.s = s.s;
+    out.T = s.T;
+  }
+
   /** Родить новый вид от родителя: параметры — маленький шаг эволюции
    *  в пределах безопасной полосы вокруг исконных (жизнеспособность),
    *  черты — наследие с вариацией. null — таблица видов переполнена. */
@@ -428,7 +439,11 @@ export class Biosphere {
       hooks.feed(kind, wx, wy, text);
     };
 
-    for (const r of [...this.recs.values()]) {
+    // снимок живых блюдцев — один на весь тик, без копирования массива
+    this.iter.length = 0;
+    for (const r of this.recs.values()) this.iter.push(r);
+    for (let ii = 0; ii < this.iter.length; ii++) {
+      const r = this.iter[ii];
       const s = this.sp(r.sp);
 
       // болезнь: колония гаснет постепенно, тик за тиком — без обнулений
@@ -496,7 +511,10 @@ export class Biosphere {
     }
 
     // фронтир: встретившиеся виды вступают в отношения — война или симбиоз
-    for (const a of this.recs.values()) {
+    this.iter.length = 0;
+    for (const r of this.recs.values()) this.iter.push(r);
+    for (let ii = 0; ii < this.iter.length; ii++) {
+      const a = this.iter[ii];
       for (let d = 0; d < 2; d++) {
         const tx = a.wx + (d === 0 ? 1 : 0);
         const ty = a.wy + (d === 0 ? 0 : 1);

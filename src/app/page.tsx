@@ -7,9 +7,9 @@ import { PondEngine, speciesColorJS, DISH, WORLD, LOD_LO, LOD_HI, type PondStats
 import { Biosphere, POP_PER_MASS, type EcoRec, type FeedKind } from '@/lib/lenia/eco';
 import { BlobTracker, type EventKind } from '@/lib/lenia/tracker';
 
-const SPEED_MIN = 0.25;
-const SPEED_MAX = 8;
-const SPEED_PRESETS = [0.5, 1, 2, 4, 8];
+const SPEED_MIN = 1;
+const SPEED_MAX = 100;
+const SPEED_PRESETS = [1, 2, 5, 10, 50, 100];
 const BASE_SPS = 12; // честных шагов Lenia на блюдце в секунду при ×1
 const PLACE_PX = 220; // блюдце крупнее этого — тап сажает существо, меньше — перелёт
 const STATS_MS = 500;
@@ -110,7 +110,7 @@ export default function Page() {
   const camRef = useRef({ x: WORLD / 2, y: WORLD / 2, scale: 60 });
   const animRef = useRef<{ t0: number; dur: number; from: { x: number; y: number; scale: number }; to: { x: number; y: number; scale: number } } | null>(null);
   const sizeRef = useRef({ w: 0, h: 0, dpr: 1 });
-  const budgetRef = useRef(40); // шагов Lenia за кадр (адаптируется под устройство)
+  const budgetRef = useRef(120); // шагов Lenia за кадр (адаптируется под устройство)
   const fpsRef = useRef(0);
   const emaRef = useRef(16.7);
   const runningRef = useRef(true);
@@ -200,7 +200,7 @@ export default function Page() {
 
     const coarse = window.matchMedia('(pointer: coarse)').matches;
     const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1.5 : 2);
-    if (engine.softGL) budgetRef.current = 0.35; // программный рендер — беречь
+    if (engine.softGL) budgetRef.current = 6; // программный рендер — беречь
 
     const rsRef = { current: engine.softGL ? 0.5 : 1 }; // адаптивное разрешение рендера
 
@@ -577,7 +577,8 @@ export default function Page() {
         case 'Digit2':
         case 'Digit3':
         case 'Digit4':
-        case 'Digit5': {
+        case 'Digit5':
+        case 'Digit6': {
           const idx = parseInt(e.code.slice(-1), 10) - 1;
           if (idx < SPEED_PRESETS.length) setSpeed(SPEED_PRESETS[idx]);
           break;
@@ -661,6 +662,19 @@ export default function Page() {
     const aliveList: EcoRec[] = [];
     const matList: number[] = []; // блюдца, желающие материализоваться (ключи)
     let matStamp = 0;
+    // переиспользуемые структуры — ноль аллокаций в кадре (без утечек и GC-фризов)
+    const zoneAKeys = new Set<number>();
+    const cacheFor = new Int16Array(SLOTS);
+    const nearList: EcoRec[] = [];
+    const farList: EcoRec[] = [];
+    const farSteps: number[] = [];
+    const stepPool: { slot: number; sp: number; m: number; s: number; T: number }[] = [];
+    for (let i = 0; i < 2048; i++) stepPool.push({ slot: 0, sp: 0, m: 0.15, s: 0.015, T: 10 });
+    let lodRenderRev = -1;
+    let lodReadRev = -1;
+    let statsCache: PondStats = { mass: 0, pop: 0, blobs: [] };
+    let statsSlotFresh = -1;
+    let lastFocusSteps = 0;
 
     /** Пересобрать список желаемых блюдцев: видимая область при большом
      *  зуме, пузырь вокруг камеры — при среднем. Ближние — первыми. */
@@ -669,6 +683,7 @@ export default function Page() {
       const { w, h } = sizeRef.current;
       const scale = cam.scale;
       const want: number[] = [];
+      zoneAKeys.clear();
       let radius = 0;
       if (scale >= LOD_LO) {
         const vx0 = Math.floor(cam.x - w / (2 * scale)) - 1;
@@ -677,12 +692,18 @@ export default function Page() {
         const vy1 = Math.ceil(cam.y + h / (2 * scale)) + 1;
         radius = Math.max(vx1 - vx0, vy1 - vy0) / 2 + 2;
         for (const [k, r] of world.recs) {
-          if (r.wx >= vx0 && r.wx <= vx1 && r.wy >= vy0 && r.wy <= vy1) want.push(k);
+          if (r.wx >= vx0 && r.wx <= vx1 && r.wy >= vy0 && r.wy <= vy1) {
+            want.push(k);
+            zoneAKeys.add(k);
+          }
         }
       } else if (scale >= BUBBLE_PX) {
         radius = BUBBLE_R;
         for (const [k, r] of world.recs) {
-          if (Math.abs(r.wx - cam.x) <= BUBBLE_R && Math.abs(r.wy - cam.y) <= BUBBLE_R) want.push(k);
+          if (Math.abs(r.wx - cam.x) <= BUBBLE_R && Math.abs(r.wy - cam.y) <= BUBBLE_R) {
+            want.push(k);
+            zoneAKeys.add(k);
+          }
         }
       }
       want.sort((a, b) => {
@@ -707,18 +728,27 @@ export default function Page() {
         lastFocus = '';
       }
       const r = world.peek(fd.x, fd.y);
-      let st: PondStats = { mass: 0, pop: 0, blobs: [] };
+      // асинхронный анализ блюдца в фокусе: без синхронных readPixels
+      const done = engine.pollStats();
+      if (done) {
+        statsCache = done.stats;
+        statsSlotFresh = done.slot;
+      }
+      const real = !!r && r.mat >= 0;
+      const useReal = real && statsSlotFresh === r!.mat;
+      if (real) engine.requestStats(r!.mat);
+      let st: PondStats = useReal ? statsCache : { mass: 0, pop: 0, blobs: [] };
       let t = 0;
       let events: { kind: EventKind; t: number; x: number; y: number }[] = [];
-      const real = !!r && r.mat >= 0;
-      if (real) {
-        st = engine.stats(r!.mat);
+      if (useReal) {
         t = r!.matSteps * (1 / world.speciesT(r!.sp));
-        const stepsSince = Math.max(1, Math.round(speedRef.current * ((now - lastStats) / 16.7)));
+        const stepsSince = Math.max(1, r!.matSteps - lastFocusSteps);
+        lastFocusSteps = r!.matSteps;
         events = trackerRef.current.update(st.blobs, t, stepsSince);
       } else {
         trackerRef.current.reset();
         t = Math.round(world.time);
+        lastFocusSteps = r ? r.matSteps : 0;
       }
       if (events.length > 0 && now - guardRef.current > 900) {
         for (const ev of events.slice(0, 3)) {
@@ -732,11 +762,11 @@ export default function Page() {
         lastFocus = key;
         hudCbRef.current({
           t,
-          pop: real ? st.pop : r ? Math.round(r.pop) : 0,
+          pop: useReal ? st.pop : r ? Math.round(r.pop) : 0,
           fps: Math.round(fpsRef.current),
           spName: r && r.sp >= 0 ? world.speciesName(r.sp) : 'пусто',
           spRole: r && r.sp >= 0 ? world.speciesRole(r.sp) : '',
-          real,
+          real: useReal,
           planet: world.aliveCount(),
           species: world.aliveSpeciesCount(),
           events: [...feedRef.current],
@@ -797,13 +827,14 @@ export default function Page() {
         visRef.current = { x0: vx0, y0: vy0, x1: vx1, y1: vy1, count: (vx1 - vx0) * (vy1 - vy0) };
 
         // материализация: блюдце получает слот, когда попадает в зону
-        // детализации у камеры; при отдалении слот освобождается, но жизнь
-        // блюдца продолжает течь статистически — без обнулений и blanks
+        // детализации у камеры. При выходе из зоны слот НЕ стирается —
+        // жизнь блюдца кэшируется ещё несколько тиков, и при возврате
+        // камеры колония продолжается с того же места (без всхлопываний)
         if (now - matStamp > MAT_MS) updateMaterialization(now);
         let ops = 0;
         for (const key of matList) {
           const r = world.byKey(key);
-          if (!r || r.mat >= 0) continue;
+          if (!r || r.mat >= 0) continue; // закэшированное блюдце уже живо
           if (ops >= MAT_OPS) break;
           const slot = allocSlot(key);
           if (slot < 0) break;
@@ -816,101 +847,104 @@ export default function Page() {
           ops++;
         }
         if (ops > 0) flushMeta();
-        if (matRadius > 0) {
-          // выселяем блюдца, ушедшие далеко от зоны детализации
-          let freed = 0;
-          const lim = (matRadius * 1.7 + 2) * (matRadius * 1.7 + 2);
-          for (let s = 0; s < SLOTS && freed < 8; s++) {
-            const k = slotDish[s];
-            if (k < 0) continue;
-            const r = world.byKey(k);
-            if (!r) {
-              slotDish[s] = -1;
-              matCount--;
-              freeSlots.push(s);
-              continue;
-            }
-            const dx = r.wx - cam.x;
-            const dy = r.wy - cam.y;
-            if (dx * dx + dy * dy > lim) {
-              releaseAndFree(s);
-              freed++;
-            }
-          }
-          if (freed > 0) flushMeta();
-        }
 
-        // живые материализованные блюдца
+        // живые материализованные блюдца зоны детализации
         aliveList.length = 0;
-        for (let s = 0; s < SLOTS; s++) {
-          const k = slotDish[s];
-          if (k < 0) continue;
-          const r = world.byKey(k);
-          if (r && r.mat === s) aliveList.push(r);
-          else if (r && r.mat !== s) {
-            // слот уже не принадлежит блюдцу — почистим
-            slotDish[s] = -1;
-            matCount--;
-            freeSlots.push(s);
-          } else {
-            slotDish[s] = -1;
-            matCount--;
-            freeSlots.push(s);
-          }
+        for (const key of matList) {
+          const r = world.byKey(key);
+          if (r && r.mat >= 0) aliveList.push(r);
         }
 
-        // честные шаги Lenia: каждое блюдце хочет BASE_SPS×скорость шагов
-        // в СЕКУНДУ (не на кадр — темп не зависит от fps устройства).
-        // Блюдца у камеры получают полный темп первыми — скорость всегда видна
+        // честные шаги Lenia — ИНСТАНСИРОВАННЫМИ пакетами: один проход
+        // на все блюдца вместо пары draw call на каждое. Ближний круг
+        // всегда получает полный темп — скорость видна при любом бюджете
         if (runningRef.current && aliveList.length > 0) {
-          stepAcc += BASE_SPS * speedRef.current * frameDt * aliveList.length;
-          let n = Math.floor(stepAcc);
-          const cap = Math.min(Math.round(budgetRef.current), engine.softGL ? 3 : 700);
-          if (n > cap) {
-            n = cap;
-            stepAcc = 0;
-          } else stepAcc -= n;
-          // ближний круг (радиус 3 блюдца от камеры) всегда получает свой
-          // полный темп — влияние скорости видно при любом бюджете устройства
-          const share = Math.max(1, Math.round(BASE_SPS * speedRef.current * frameDt));
-          const nearCap = engine.softGL ? 4 : 400;
-          let done = 0;
-          for (let i = 0; i < aliveList.length && done < nearCap; i++) {
-            const r = aliveList[i];
-            const dx = r.wx - cam.x;
-            const dy = r.wy - cam.y;
-            if (dx * dx + dy * dy > 9) continue; // только ближний круг
-            for (let k2 = 0; k2 < share && done < nearCap; k2++) {
-              engine.stepSlot(r.mat, world.dishParams(r));
-              r.matSteps++;
-              done++;
+          stepAcc += BASE_SPS * speedRef.current * frameDt;
+          const share = Math.floor(stepAcc);
+          stepAcc -= share;
+          if (share > 0) {
+            nearList.length = 0;
+            farList.length = 0;
+            for (const r of aliveList) {
+              const dx = r.wx - cam.x;
+              const dy = r.wy - cam.y;
+              if (dx * dx + dy * dy <= 9) nearList.push(r);
+              else farList.push(r);
+            }
+            const nearTotalCap = engine.softGL ? 8 : 480;
+            const kNear = nearList.length > 0 ? Math.min(share, 64, Math.max(1, Math.floor(nearTotalCap / nearList.length))) : 0;
+            let budgetLeft = Math.min(Math.round(budgetRef.current), engine.softGL ? 12 : 4000) - kNear * nearList.length;
+            farSteps.length = farList.length;
+            for (let i = 0; i < farList.length; i++) farSteps[i] = 0;
+            let maxK = kNear;
+            let guard2 = 0;
+            while (budgetLeft > 0 && farList.length > 0 && guard2++ < 100000) {
+              const i = cursor++ % farList.length;
+              farSteps[i]++;
+              budgetLeft--;
+              if (farSteps[i] > maxK) maxK = farSteps[i];
+            }
+            for (let p = 0; p < maxK; p++) {
+              // сторож кадра: проход 0 выполняется всегда (минимальный прогресс
+              // у всех блюдц), дальние проходы — пока есть запас времени кадра
+              if (p > 0 && performance.now() - now > 12) break;
+              let cnt2 = 0;
+              if (p < kNear) {
+                for (const r of nearList) {
+                  const it = stepPool[cnt2++];
+                  it.slot = r.mat;
+                  world.dishParamsInto(r, it);
+                  r.matSteps++;
+                }
+              }
+              for (let i = 0; i < farList.length; i++) {
+                if (farSteps[i] <= p) continue;
+                const r = farList[i];
+                const it = stepPool[cnt2++];
+                it.slot = r.mat;
+                world.dishParamsInto(r, it);
+                r.matSteps++;
+              }
+              engine.stepBatch(stepPool, cnt2);
             }
           }
-          let rest = n - done;
-          if (rest < 0) rest = 0;
-          while (rest > 0) {
-            const r = aliveList[cursor++ % aliveList.length];
-            engine.stepSlot(r.mat, world.dishParams(r));
-            r.matSteps++;
-            rest--;
-          }
         }
 
-        // LOD нужен для рендера только при отдалении; на программном рендере — реже
-        if (matCount > 0 && cam.scale < LOD_HI && (!engine.softGL || frames % 3 === 0)) engine.genLod();
+        // LOD нужен для рендера только при отдалении и только когда
+        // атлас менялся (шаги/посадки/болезни) — при паузе не пересобираем
+        const rev = engine.stateRevision;
+        if (matCount > 0 && cam.scale < LOD_HI && rev !== lodRenderRev && (!engine.softGL || frames % 3 === 0)) {
+          engine.genLod();
+          lodRenderRev = rev;
+        }
         engine.regenMetaMips();
         engine.render(cam, { x: cdx, y: cdy }, now / 1000, dpr * rsRef.current);
         drawGlows(now);
 
-        const ecoEvery = engine.softGL ? 1000 : ECO_MS;
+        // тик биосферы: при высокой скорости — чаще, но с ограниченным dt
+        const ecoEvery = engine.softGL ? 1000 : Math.max(140, Math.round(ECO_MS / Math.sqrt(speedRef.current)));
         if (now - lastEco >= ecoEvery) {
           lastEco = now;
-          if (matCount > 0) {
-            if (cam.scale >= LOD_HI) engine.genLod(); // свежий LOD для проб масс
-            world.syncMasses(slotDish, engine.readLod(), engine.lodTexSide, engine.slotSide);
+          const lod = engine.pollLod();
+          if (matCount > 0 && rev !== lodReadRev) {
+            if (cam.scale >= LOD_HI) engine.genLod();
+            engine.requestLod();
+            lodReadRev = rev;
+          }
+          if (lod) world.syncMasses(slotDish, lod, engine.lodTexSide, engine.slotSide);
+          // кэш слотов: блюдца вне зоны детализации держат свою жизнь
+          // до 6 тиков — при возврате камеры колония не пересевается
+          for (let s = 0; s < SLOTS; s++) {
+            const k = slotDish[s];
+            if (k < 0) continue;
+            if (zoneAKeys.has(k)) {
+              cacheFor[s] = 0;
+              continue;
+            }
+            if (++cacheFor[s] > 6) releaseAndFree(s);
           }
           world.setCamera(cdx, cdy);
-          if (runningRef.current) world.tick(0.5 * (ecoEvery / 500) * speedRef.current, hooks); // на паузе планета замерла
+          if (runningRef.current) world.tick(Math.min(4, 0.5 * (ecoEvery / 500) * speedRef.current), hooks);
           world.buildMeta();
           flushMeta();
         }
@@ -1261,35 +1295,23 @@ function SpeedPanel({ value, onChange, onClose }: { value: number; onChange: (v:
       >
         <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-300/80">Скорость времени</p>
         <p className="mt-0.5 font-mono text-lg font-bold text-emerald-200">{fmtSpeed(value)}</p>
-        <input
-          id="speed-slider"
-          data-testid="speed-slider"
-          type="range"
-          min={SPEED_MIN}
-          max={SPEED_MAX}
-          step={0.05}
-          value={value}
-          onChange={(e) => onChange(parseFloat(e.target.value))}
-          className="mt-2 w-full cursor-pointer accent-emerald-400"
-        />
-        <div className="mt-0.5 flex justify-between font-mono text-[9px] text-neutral-500">
-          <span>×¼</span>
-          <span>×2</span>
-          <span>×8</span>
-        </div>
-        <div className="mt-2.5 grid grid-cols-5 gap-1">
+        <div className="mt-2.5 grid grid-cols-3 gap-1.5">
           {SPEED_PRESETS.map((p) => (
             <button
               key={p}
               onClick={() => onChange(p)}
-              className={`rounded-lg border px-1 py-1.5 font-mono text-[11px] transition-colors ${
-                Math.abs(value - p) < 0.001 ? 'border-emerald-400/60 bg-emerald-900/50 text-emerald-100' : 'border-white/10 bg-white/[0.03] text-neutral-300'
+              data-testid={`speed-${p}`}
+              className={`h-10 rounded-xl border font-mono text-sm transition-all active:scale-95 ${
+                Math.abs(value - p) < 0.001
+                  ? 'border-emerald-400/60 bg-emerald-900/60 text-emerald-100'
+                  : 'border-white/10 bg-white/[0.03] text-neutral-300 hover:bg-white/[0.07]'
               }`}
             >
-              {p === 0.5 ? '½' : p}
+              ×{p}
             </button>
           ))}
         </div>
+        <p className="mt-2 text-[10px] leading-relaxed text-neutral-500">Клавиши 1–6 · большие скорости — максимум возможностей устройства</p>
       </div>
     </>
   );
