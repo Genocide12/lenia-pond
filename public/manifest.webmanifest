@@ -1,0 +1,17 @@
+{
+  "name": "Пруд Лении",
+  "short_name": "Пруд",
+  "description": "Пруд из тысяч живых блюдцев: зум, разные виды и климаты, деление и гибель.",
+  "lang": "ru",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#040806",
+  "theme_color": "#040806",
+  "icons": [
+    { "src": "./icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

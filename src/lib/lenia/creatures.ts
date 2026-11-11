@@ -24,7 +24,7 @@ const DATA: CreatureData[] = [
   {
     "id": "O2u",
     "name": "Orbium unicaudatus",
-    "ru": "Орбий",
+    "ru": "Головастик",
     "desc": "Первооткрыватель Lenia — непрерывный потомок глайдера Конвея. Ровно скользит по тору.",
     "kind": "glider",
     "kindRu": "глайдер",
@@ -358,3 +358,48 @@ function decodeAll(list: CreatureData[]): Creature[] {
 }
 
 export const CREATURES: Creature[] = decodeAll(DATA);
+
+/** Виды для пруда блюдцев: помещаются в тор 96×96 (w+2R ≤ 96), проверены NumPy. */
+export const POND_SPECIES: string[] = [
+  'O2u', // Головастик
+  'sbug', // Жук — очень быстрый (T=1)
+  'OG2g', // Волчок
+  'S1v', // Щит
+  'K4s', // Крониум
+  'O2p', // Призрак
+  'H3s', // Спираль
+  '2S1f', // Пила
+  'OV2u', // Странник
+  'K9a', // Цветок
+  'GH2l', // Гриб — репликатор
+];
+
+/** Поворот паттерна на 90°×k (Ления эквивариантна поворотам — существо остаётся живым). */
+export function rotateCells(cells: number[], w: number, h: number, quarterTurns: number) {
+  let cur = cells.slice();
+  let cw = w;
+  let ch = h;
+  for (let t = 0; t < ((quarterTurns % 4) + 4) % 4; t++) {
+    const next = new Array<number>(cw * ch);
+    for (let y = 0; y < ch; y++) {
+      for (let x = 0; x < cw; x++) {
+        next[x * ch + (ch - 1 - y)] = cur[y * cw + x];
+      }
+    }
+    cur = next;
+    const tmp = cw;
+    cw = ch;
+    ch = tmp;
+  }
+  return { cells: cur, w: cw, h: ch };
+}
+
+/**
+ * Экотипы для блюдца 96×96 (проверено NumPy в чистом float32,
+ * scripts/verify_ecotype2.py): гриб с s×1.1 образует стабильную колонию
+ * 22–27 организмов во всех прогонах, исходные же параметры хаотичны —
+ * колония возникает лишь в ~30% прогонов (точность GPU этого не прощает).
+ */
+export const POND_ECOTYPES: Record<string, { m?: number; s?: number }> = {
+  GH2l: { s: 0.0396 },
+};

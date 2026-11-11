@@ -120,3 +120,68 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ---- приложение, а не страница ---- */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
+}
+
+/* панель-рейка: колонка на высоких экранах, строка на низких (телефон лежа) */
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+@media (max-height: 540px) {
+  .rail {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 200px;
+  }
+}
+
+/* полоса видов: мягкие края под скролл */
+.species-strip {
+  mask-image: linear-gradient(to right, transparent, black 12px, black calc(100% - 12px), transparent);
+}
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 22px;
+  background: transparent;
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, #0e7490, #525252, #d97706);
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  margin-top: -7px;
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  background: #34d399;
+  border: 2px solid #064e3b;
+}
+input[type='range']::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, #0e7490, #525252, #d97706);
+}
+input[type='range']::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  background: #34d399;
+  border: 2px solid #064e3b;
+}
