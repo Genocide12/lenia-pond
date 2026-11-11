@@ -1,13 +1,17 @@
 /**
- * Пруд Лении — движок «бесконечной биосферы» на WebGL2.
+ * Пруд Лении — движок конечной биосферы на WebGL2.
  *
- * Мир — бесконечная сетка блюдцев (каждое — тор DISH×DISH клеток).
- * Возле камеры блюдца материализуются в пул из S×S слотов атласа R32F
- * и считаются честной Lenia (Bert Wang-Chak Chan): A ← clip(A + dt·G(K∗A)).
- * Вся планета за пределами пула живёт статистически (lib/lenia/eco.ts)
- * и рисуется по мета-текстуре META×META: одно блюдце — один тексель.
- * Дальше мета-текстуры мир процедурный (хэш координат в шейдере),
- * поэтому полей бесконечно много на любом устройстве.
+ * Мир — поле WORLD×WORLD блюдц (каждое — тор DISH×DISH клеток): ровно
+ * 2000×2000 клеток. ВСЕ блюдца всегда материализованы в атласе R32F
+ * (слот = блюдце, закреплён навсегда), поэтому жизнь течёт в каждом
+ * блюдце при любом зуме — без переинициализаций, обнулений и потери
+ * состояния при отдалении камеры.
+ *
+ * Блюдца считаются честной Lenia (Bert Wang-Chak Chan):
+ * A ← clip(A + dt·G(K∗A)). Для отдалённой камеры каждый кадр строится
+ * LOD-текстура (10×10 текселей на блюдце, усреднение на GPU) — по ней
+ * дальний план рисуется плавной «цветной движущейся картиной» без
+ * мерцания, а каждая колония остаётся различимой.
  *
  * Точность float32 обязательна: на float16 каскад деления гриба ломается
  * (scripts/verify_precision.py). Производительность не зависит от зума:
@@ -16,9 +20,14 @@
 
 import { POND_LIST, rotateCells, type Creature } from './creatures';
 
-export const DISH = 96; // клеток в блюдце (должно совпадать с шейдерами)
+export const DISH = 100; // клеток в блюдце (должно совпадать с шейдерами)
+export const WORLD = 20; // блюдц в стороне поля → 20×100 = 2000 клеток
 export const META = 256; // сторона мета-текстуры планеты (блюдц)
-export const TEX_PX = 21; // минимальный размер блюдца в пикселях для текстурного рендера
+export const LOD_N = 10; // текселей LOD на блюдце по стороне
+export const LOD_CELL = DISH / LOD_N; // клеток, усредняемых в один тексель LOD
+export const LOD_TEX = WORLD * LOD_N; // сторона LOD-текстуры (200)
+export const LOD_LO = 40; // px на блюдце: ниже — чистый LOD-рендер
+export const LOD_HI = 64; // px на блюдце: выше — честная выборка клеток
 
 export interface Palette {
   id: string;
@@ -45,11 +54,6 @@ const SPECIES_PALETTE = ['bio', 'magma', 'viridis', 'solar', 'viridis', 'bio', '
 export function speciesPalette(i: number): Palette {
   return PALETTES.find((p) => p.id === SPECIES_PALETTE[i]) ?? PALETTES[0];
 }
-
-/* ---------- климат и мутации (зеркало шейдера шага) ---------- */
-
-export const CLIMATE_DM = 0.035; // амплитуда сдвига m (проверено свипом verify_climate.py)
-export const CLIMATE_DS = 0.22; // амплитуда растяжения s
 
 /* ---------- ядро и рост (JS-зеркало для нормировки) ---------- */
 
@@ -126,7 +130,7 @@ void main() {
     for (int dx = -uR; dx <= uR; dx++) {
       float k = texelFetch(uKernel, ivec2(dx + uR, dy + uR), 0).r;
       if (k != 0.0) {
-        ivec2 p = uOrigin + ((lc + ivec2(dx, dy) + 96) % 96);
+        ivec2 p = uOrigin + ((lc + ivec2(dx, dy) + ${DISH}) % ${DISH});
         u += k * texelFetch(uState, p, 0).r;
       }
     }
@@ -166,19 +170,24 @@ void main() {
   }
 }`;
 
-/** Средняя масса блюдца — редукция 96×96 в один пиксель (дешёвая проба). */
-const PROBE_FRAG = `#version 300 es
+/** LOD всего мира за один проход: каждый тексель — среднее блока LOD_CELL². */
+const LOD_FRAG = `#version 300 es
 precision highp float;
 precision highp int;
 uniform sampler2D uState;
-uniform ivec2 uOrigin;
 out vec4 frag;
 void main() {
+  ivec2 lc = ivec2(gl_FragCoord.xy);
+  ivec2 dish = ivec2(lc.x / ${LOD_N}, lc.y / ${LOD_N});
+  ivec2 sub = ivec2(lc.x - dish.x * ${LOD_N}, lc.y - dish.y * ${LOD_N});
+  ivec2 org = ivec2(dish.x * ${DISH} + sub.x * ${LOD_CELL}, dish.y * ${DISH} + sub.y * ${LOD_CELL});
   float s = 0.0;
-  for (int y = 0; y < 96; y++) {
-    for (int x = 0; x < 96; x++) s += texelFetch(uState, uOrigin + ivec2(x, y), 0).r;
+  for (int y = 0; y < ${LOD_CELL}; y++) {
+    for (int x = 0; x < ${LOD_CELL}; x++) {
+      s += texelFetch(uState, org + ivec2(x, y), 0).r;
+    }
   }
-  frag = vec4(s / 9216.0, 0.0, 0.0, 1.0);
+  frag = vec4(s / float(${LOD_CELL * LOD_CELL}), 0.0, 0.0, 1.0);
 }`;
 
 const COPY_FRAG = `#version 300 es
@@ -193,16 +202,13 @@ const RENDER_FRAG = `#version 300 es
 precision highp float;
 precision highp int;
 uniform sampler2D uState;
+uniform sampler2D uLod;
 uniform sampler2D uMeta;
 uniform vec3 uPal[66];
 uniform vec2 uCam;
 uniform float uScale;
 uniform vec2 uRes;
-uniform ivec2 uWin;
-uniform ivec2 uMetaOrg;
-uniform int uSlots;
 uniform float uTime;
-uniform float uSpeed;
 uniform float uGamma;
 uniform vec2 uFocus;
 out vec4 frag;
@@ -222,81 +228,87 @@ vec3 palette(int sp, float t) {
   return mix(uPal[base + i], uPal[base + i + 1], f);
 }
 float field(ivec2 origin, vec2 f) {
-  vec2 p = f * 96.0 - 0.5;
+  vec2 p = f * float(${DISH}) - 0.5;
   ivec2 i0 = ivec2(floor(p));
   vec2 fr = p - vec2(i0);
-  ivec2 w0 = (i0 + 96) % 96;
-  ivec2 w1 = ivec2((i0.x + 1 + 96) % 96, w0.y);
-  ivec2 w2 = ivec2(w0.x, (i0.y + 1 + 96) % 96);
+  ivec2 w0 = (i0 + ${DISH}) % ${DISH};
+  ivec2 w1 = ivec2((i0.x + 1 + ${DISH}) % ${DISH}, w0.y);
+  ivec2 w2 = ivec2(w0.x, (i0.y + 1 + ${DISH}) % ${DISH});
   float a = texelFetch(uState, origin + w0, 0).r;
   float b = texelFetch(uState, origin + w1, 0).r;
   float c = texelFetch(uState, origin + w2, 0).r;
   float d = texelFetch(uState, origin + ivec2(w1.x, w2.y), 0).r;
   return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
 }
+// ручная билинейка: R32F нельзя фильтровать LINEAR без OES_texture_float_linear
+float lodSample(vec2 uv) {
+  vec2 p = uv * float(${LOD_TEX}) - 0.5;
+  ivec2 i0 = ivec2(floor(p));
+  vec2 fr = p - vec2(i0);
+  ivec2 mn = ivec2(0);
+  ivec2 mx = ivec2(${LOD_TEX} - 1);
+  ivec2 c0 = clamp(i0, mn, mx);
+  ivec2 c1 = clamp(i0 + ivec2(1), mn, mx);
+  float a = texelFetch(uLod, c0, 0).r;
+  float b = texelFetch(uLod, ivec2(c1.x, c0.y), 0).r;
+  float c = texelFetch(uLod, ivec2(c0.x, c1.y), 0).r;
+  float d = texelFetch(uLod, c1, 0).r;
+  return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+}
 void main() {
   vec2 px = gl_FragCoord.xy;
   vec2 w = uCam + (px - uRes * 0.5) / uScale;
   vec2 q = px / uRes - 0.5;
-  vec3 bg = vec3(0.006, 0.013, 0.011) * (1.0 - 0.4 * dot(q, q));
+  vec3 bg = vec3(0.005, 0.011, 0.010) * (1.0 - 0.4 * dot(q, q));
+
+  // вне конечного поля — тёмная бездна с мягким ореолом края мира
+  vec2 dout = max(vec2(0.0) - w, w - vec2(float(${WORLD})));
+  float od = max(dout.x, dout.y);
+  if (od > 0.0) {
+    vec3 halo = vec3(0.012, 0.055, 0.034) * exp(-od * 2.6);
+    frag = vec4(bg * 0.55 + halo, 1.0);
+    return;
+  }
+
   vec2 dishf = floor(w);
   vec2 f = fract(w);
   ivec2 di = ivec2(dishf);
   float h1 = hash12(dishf);
 
-  int sp; float life; float clim; float flash; int fkind;
-  bool mat = false;
-  ivec2 mxy = di - uMetaOrg;
-  if (mxy.x >= 0 && mxy.y >= 0 && mxy.x < 256 && mxy.y < 256) {
-    vec4 m = texelFetch(uMeta, mxy, 0);
-    sp = int(m.r * 255.0 + 0.5) - 1;
-    int g = int(m.g * 255.0 + 0.5);
-    life = float(g & 63) / 63.0;
-    clim = float(g >> 6) / 3.0;
-    mat = m.b > 0.5;
-    int a = int(m.a * 255.0 + 0.5);
-    fkind = a >> 6;
-    flash = float(a & 63) / 63.0;
-  } else {
-    // бесконечный процедурный мир за пределами мета-текстуры
-    sp = hash12(dishf + 7.3) < 0.55 ? int(hash12(dishf + 3.7) * 11.0) : -1;
-    clim = hash12(dishf + 5.9);
-    life = sp >= 0 ? 0.4 + 0.45 * tri(uTime * uSpeed * (0.05 + 0.09 * hash12(dishf + 9.1)) + h1) : 0.0;
-    fkind = 0;
-    flash = 0.0;
-  }
-  vec3 water = mix(vec3(0.014, 0.040, 0.044), vec3(0.052, 0.028, 0.010), clim) * (0.7 + 0.6 * h1);
-  float tw = 0.88 + 0.12 * tri(uTime * uSpeed * (0.03 + 0.03 * h1) + h1 * 3.0);
+  vec4 m = texelFetch(uMeta, di, 0);
+  int sp = int(m.r * 255.0 + 0.5) - 1;
+  int fa = int(m.a * 255.0 + 0.5);
+  int fkind = fa >> 6;
+  float flash = float(fa & 63) / 63.0;
 
-  ivec2 sc = di - uWin;
-  bool canTex = mat && sc.x >= 0 && sc.y >= 0 && sc.x < uSlots && sc.y < uSlots;
-  bool textured = canTex && uScale > ${TEX_PX}.0;
-  // статистический слой: круглый сгусток жизни вместо сплошной заливки
-  vec3 colStat = water;
-  if (sp >= 0) {
-    float l = clamp(life * tw, 0.0, 1.0);
-    if (l > 0.03) {
-      float dl = length(f - vec2(0.5));
-      float rad = max(0.20, l * 0.55);
-      float colony = 1.0 - smoothstep(rad - 0.16, rad + 0.06, dl);
-      colStat = max(colStat, palette(sp, 0.2 + 0.8 * l) * (0.30 + 0.70 * l) * (0.30 + 0.70 * colony));
-    }
+  vec3 water = mix(vec3(0.014, 0.040, 0.044), vec3(0.043, 0.031, 0.013), h1) * (0.72 + 0.56 * h1);
+
+  // жизнь: честная выборка клеток вблизи, сглаженный LOD вдали (без мигания)
+  ivec2 origin = ivec2(di.x * ${DISH}, di.y * ${DISH});
+  float v;
+  if (uScale >= ${LOD_HI}.0) {
+    v = field(origin, f);
+  } else if (uScale > ${LOD_LO}.0) {
+    float vd = field(origin, f);
+    float vl = lodSample((dishf + f) * float(${LOD_N}) / float(${LOD_TEX}));
+    v = mix(vl, vd, smoothstep(${LOD_LO}.0, ${LOD_HI}.0, uScale));
+  } else {
+    v = lodSample((dishf + f) * float(${LOD_N}) / float(${LOD_TEX}));
   }
-  vec3 col = colStat;
-  if (textured) {
-    float v = field(sc * 96, f);
-    float sh = v * v * (3.0 - 2.0 * v); // органичная пластика вместо пикселей
-    float vis = smoothstep(0.02, 0.12, v); // пустая вода не заливается цветом палитры
-    vec3 colTex = sp >= 0 ? mix(water, palette(sp, pow(sh, uGamma)), vis) : water;
-    col = mix(colStat, colTex, smoothstep(${TEX_PX}.0, ${TEX_PX + 14}.0, uScale)); // мягкий LOD-переход
-  }
+  float sh = v * v * (3.0 - 2.0 * v);
+  float vis = smoothstep(0.015, 0.11, v);
+  vec3 col = sp >= 0 ? mix(water, palette(sp, pow(sh, uGamma)), vis) : water;
+
+  // внутренняя рамка мира — тихая изумрудная кромка
+  vec2 din = min(w, vec2(float(${WORLD})) - w);
+  float rim = smoothstep(0.09, 0.0, min(din.x, din.y));
+  col = mix(col, vec3(0.05, 0.22, 0.14), rim * 0.35);
 
   vec2 dpx = min(f, 1.0 - f) * uScale;
   float edge = min(dpx.x, dpx.y);
   if (uScale > 90.0) {
     float lineA = 1.0 - smoothstep(0.0, 1.5, edge);
-    float zoomOut = clamp(1.0 - uScale / 220.0, 0.0, 1.0);
-    col = mix(col, vec3(0.10, 0.35, 0.26), lineA * (0.10 + 0.22 * zoomOut));
+    col = mix(col, vec3(0.10, 0.35, 0.26), lineA * 0.16);
   }
   if (flash > 0.003 && fkind > 0) {
     float ring = 1.0 - smoothstep(0.0, 10.0, edge);
@@ -344,11 +356,6 @@ function program(gl: WebGL2RenderingContext, fragSrc: string): WebGLProgram {
 }
 
 export class PondEngine {
-  readonly slots: number; // сторона пула (S×S блюдц)
-  readonly atlasW: number; // ширина атласа (слоты)
-  readonly atlasH: number; // высота атласа (слоты + строки парковки)
-  readonly parkRows: number; // строк парковки состояний (зум без потерь)
-  private parkFree: number[] = [];
   readonly speciesList: Creature[];
   readonly softGL: boolean; // программный рендер (SwiftShader/llvmpipe) — беречь
 
@@ -357,14 +364,14 @@ export class PondEngine {
   private fbo: WebGLFramebuffer[] = [];
   private metaTex!: WebGLTexture;
   private kernelTex: WebGLTexture[] = [];
-  private probeTex!: WebGLTexture;
-  private probeFbo!: WebGLFramebuffer;
-  private probeBuf = new Float32Array(1);
+  private lodTex!: WebGLTexture;
+  private lodFbo!: WebGLFramebuffer;
+  private lodBuf = new Float32Array(LOD_TEX * LOD_TEX);
   private scratchTex!: WebGLTexture;
   private scratchFbo!: WebGLFramebuffer;
   private progStep: WebGLProgram;
   private progPerturb: WebGLProgram;
-  private progProbe: WebGLProgram;
+  private progLod: WebGLProgram;
   private progCopy: WebGLProgram;
   private progRender: WebGLProgram;
   private norms: number[];
@@ -391,15 +398,10 @@ export class PondEngine {
     const renderer = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : '';
     this.softGL = /swiftshader|llvmpipe|software|basic render/i.test(renderer);
 
+    // атлас WORLD×WORLD блюдц, слот закреплён за блюдцем навсегда:
+    // состояние переживает любой зум, переинициализаций не бывает
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
-    const dm = (navigator as unknown as { deviceMemory?: number }).deviceMemory;
-    let slots = 20;
-    if (maxTex < 2048 || (dm && dm <= 4)) slots = 12; // слабым устройствам — меньший атлас R32F
-    this.slots = slots;
-    this.parkRows = Math.max(0, Math.min(6, Math.floor(maxTex / DISH) - slots)); // запасные строки — парковка состояний
-    this.atlasW = slots * DISH;
-    this.atlasH = (slots + this.parkRows) * DISH;
-    for (let p = 0; p < this.parkRows * slots; p++) this.parkFree.push(p);
+    if (maxTex < WORLD * DISH) throw new Error('Слишком маленький предел текстур GPU для поля 2000×2000');
 
     this.speciesList = POND_LIST;
     this.norms = this.speciesList.map((c) => kernelNorm(c.R, c.b, c.kn));
@@ -419,14 +421,15 @@ export class PondEngine {
 
     this.progStep = program(gl, STEP_FRAG);
     this.progPerturb = program(gl, PERTURB_FRAG);
-    this.progProbe = program(gl, PROBE_FRAG);
+    this.progLod = program(gl, LOD_FRAG);
     this.progCopy = program(gl, COPY_FRAG);
     this.progRender = program(gl, RENDER_FRAG);
 
+    const AW = WORLD * DISH;
     for (let i = 0; i < 2; i++) {
       const t = gl.createTexture()!;
       gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, this.atlasW, this.atlasH, 0, gl.RED, gl.FLOAT, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, AW, AW, 0, gl.RED, gl.FLOAT, null);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -434,7 +437,7 @@ export class PondEngine {
       const f = gl.createFramebuffer()!;
       gl.bindFramebuffer(gl.FRAMEBUFFER, f);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
-      gl.viewport(0, 0, this.atlasW, this.atlasH);
+      gl.viewport(0, 0, AW, AW);
       gl.clearColor(0, 0, 0, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
       this.tex.push(t);
@@ -466,14 +469,17 @@ export class PondEngine {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-    this.probeTex = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this.probeTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, null);
+    // LOD-текстура дальнего плана: NEAREST (float нельзя LINEAR), сглаживание — в шейдере
+    this.lodTex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this.lodTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, LOD_TEX, LOD_TEX, 0, gl.RED, gl.FLOAT, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    this.probeFbo = gl.createFramebuffer()!;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.probeFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.probeTex, 0);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.lodFbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.lodFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.lodTex, 0);
 
     this.scratchTex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.scratchTex);
@@ -494,7 +500,7 @@ export class PondEngine {
   }
 
   slotOrigin(slot: number): [number, number] {
-    return [(slot % this.slots) * DISH, Math.floor(slot / this.slots) * DISH];
+    return [(slot % WORLD) * DISH, Math.floor(slot / WORLD) * DISH];
   }
 
   /** Загрузить мета-текстуру планеты (RGBA, META×META). */
@@ -548,59 +554,28 @@ export class PondEngine {
     gl.texSubImage2D(gl.TEXTURE_2D, 0, ox, oy, DISH, DISH, gl.RED, gl.FLOAT, this.zeroTile);
   }
 
-  get parkCapacity(): number {
-    return this.parkRows * this.slots;
-  }
-
-  /** Спрятать живое состояние слота в парковку (GPU→GPU, без чтения в CPU). */
-  park(slot: number, into = -1): number {
-    const p = into >= 0 ? into : this.parkFree.length ? this.parkFree.pop()! : -1;
-    if (p < 0) return -1;
-    this.copyRegion(this.slots * this.slots + p, slot);
-    return p;
-  }
-
-  /** Вернуть состояние из парковки в слот и освободить место. */
-  unpark(parkIdx: number, slot: number) {
-    this.copyRegion(slot, this.slots * this.slots + parkIdx);
-    this.releasePark(parkIdx);
-  }
-
-  /** Освободить парковочное место, не возвращая состояние. */
-  releasePark(parkIdx: number) {
-    if (this.parkFree.indexOf(parkIdx) < 0) this.parkFree.push(parkIdx);
-  }
-
-  /** Копировать область 96×96 между слотами атласа (через скретч, GPU→GPU). */
-  private copyRegion(dstSlot: number, srcSlot: number) {
+  /** Очистить всё поле разом (кнопка «Очистить» — весь мир). */
+  clearAll() {
     const gl = this.gl;
-    const [sx, sy] = this.slotOrigin(srcSlot);
-    const [dx, dy] = this.slotOrigin(dstSlot);
-    gl.useProgram(this.progCopy);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
-    gl.uniform1i(this.uni(this.progCopy, 'uSrc'), 0);
-    gl.uniform2i(this.uni(this.progCopy, 'uOffset'), sx, sy);
-    gl.viewport(0, 0, DISH, DISH);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.bindTexture(gl.TEXTURE_2D, this.scratchTex);
-    gl.uniform2i(this.uni(this.progCopy, 'uOffset'), -dx, -dy);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[0]);
-    gl.viewport(dx, dy, DISH, DISH);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    for (let i = 0; i < 2; i++) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[i]);
+      gl.viewport(0, 0, WORLD * DISH, WORLD * DISH);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   /** Материализовать блюдце: очистить и поселить count организмов. */
   seedSlot(slot: number, spIdx: number, count: number) {
     this.clearSlot(slot);
+    const m = DISH - 36;
     for (let i = 0; i < count; i++) {
-      this.place(slot, spIdx, Math.floor(Math.random() * 4), 14 + Math.random() * 68, 14 + Math.random() * 68);
+      this.place(slot, spIdx, Math.floor(Math.random() * 4), 18 + Math.random() * m, 18 + Math.random() * m);
     }
   }
 
-  /** Один шаг Lenia для слота с явными параметрами (вид+климат+мутации). */
+  /** Один шаг Lenia для слота с явными параметрами (вид+мутации). */
   stepSlot(slot: number, p: StepParams) {
     const c = this.speciesList[p.sp];
     if (!c) return;
@@ -662,21 +637,26 @@ export class PondEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  /** Дешёвая проба: средняя масса блюдца (редукция на GPU, чтение 4 байт). */
-  probeMass(slot: number): number {
+  /** Перестроить LOD-текстуру дальнего плана из живого состояния (раз в кадр). */
+  genLod() {
     const gl = this.gl;
-    const [ox, oy] = this.slotOrigin(slot);
-    gl.useProgram(this.progProbe);
+    gl.useProgram(this.progLod);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
-    gl.uniform1i(this.uni(this.progProbe, 'uState'), 0);
-    gl.uniform2i(this.uni(this.progProbe, 'uOrigin'), ox, oy);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.probeFbo);
-    gl.viewport(0, 0, 1, 1);
+    gl.uniform1i(this.uni(this.progLod, 'uState'), 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.lodFbo);
+    gl.viewport(0, 0, LOD_TEX, LOD_TEX);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.readPixels(0, 0, 1, 1, gl.RED, gl.FLOAT, this.probeBuf);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return this.probeBuf[0];
+  }
+
+  /** Прочитать LOD-текстуру (LOD_TEX×LOD_TEX масс блоков) — один readPixels. */
+  readLod(): Float32Array {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.lodFbo);
+    gl.readPixels(0, 0, LOD_TEX, LOD_TEX, gl.RED, gl.FLOAT, this.lodBuf);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return this.lodBuf;
   }
 
   /** Прочитать слот в скретч (для полного анализа). */
@@ -831,11 +811,8 @@ export class PondEngine {
   /** Нарисовать мир (один проход на весь экран). */
   render(
     cam: { x: number; y: number; scale: number },
-    winOrg: { x: number; y: number },
-    metaOrg: { x: number; y: number },
     focus: { x: number; y: number },
     timeSec: number,
-    speed: number,
     dpr: number,
     gamma = 0.75,
   ) {
@@ -847,18 +824,17 @@ export class PondEngine {
     gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
     gl.uniform1i(this.uni(p, 'uState'), 0);
     gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.lodTex);
+    gl.uniform1i(this.uni(p, 'uLod'), 1);
+    gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, this.metaTex);
-    gl.uniform1i(this.uni(p, 'uMeta'), 1);
+    gl.uniform1i(this.uni(p, 'uMeta'), 2);
     const nu = Math.min(this.speciesList.length, 11);
     gl.uniform3fv(this.uni(p, 'uPal'), this.palUniform.subarray(0, nu * 6 * 3));
     gl.uniform2f(this.uni(p, 'uCam'), cam.x, cam.y);
     gl.uniform1f(this.uni(p, 'uScale'), cam.scale * dpr);
     gl.uniform2f(this.uni(p, 'uRes'), canvas.width, canvas.height);
-    gl.uniform2i(this.uni(p, 'uWin'), winOrg.x, winOrg.y);
-    gl.uniform2i(this.uni(p, 'uMetaOrg'), metaOrg.x, metaOrg.y);
-    gl.uniform1i(this.uni(p, 'uSlots'), this.slots);
     gl.uniform1f(this.uni(p, 'uTime'), timeSec);
-    gl.uniform1f(this.uni(p, 'uSpeed'), speed);
     gl.uniform1f(this.uni(p, 'uGamma'), gamma);
     gl.uniform2f(this.uni(p, 'uFocus'), focus.x, focus.y);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -872,13 +848,13 @@ export class PondEngine {
     for (const t of this.tex) gl.deleteTexture(t);
     for (const t of this.kernelTex) gl.deleteTexture(t);
     gl.deleteTexture(this.metaTex);
-    gl.deleteTexture(this.probeTex);
-    gl.deleteFramebuffer(this.probeFbo);
+    gl.deleteTexture(this.lodTex);
+    gl.deleteFramebuffer(this.lodFbo);
     gl.deleteTexture(this.scratchTex);
     gl.deleteFramebuffer(this.scratchFbo);
     gl.deleteProgram(this.progStep);
     gl.deleteProgram(this.progPerturb);
-    gl.deleteProgram(this.progProbe);
+    gl.deleteProgram(this.progLod);
     gl.deleteProgram(this.progCopy);
     gl.deleteProgram(this.progRender);
   }
