@@ -32,6 +32,7 @@ export interface EcoRec {
   matSteps: number; // честные шаги Lenia в текущей материализации
   strikes: number; // подряд перенаселений
   lean: number; // подряд голодных проб
+  park: number; // парковочное место GPU или -1 (жизнь пережила отдаление)
   flashKind: number; // 0 нет, 1 рождение, 2 вирус, 3 гибель
   flashUntil: number; // мировое время конца вспышки
 }
@@ -42,6 +43,7 @@ export interface EcoHooks {
   perturb(slot: number, mode: number, seed: number): void;
   clearSlot(slot: number): void;
   placeImmigrant(slot: number, sp: number): void;
+  releasePark(park: number): void;
   feed(kind: FeedKind, wx: number, wy: number): void;
 }
 
@@ -102,6 +104,7 @@ function seedRec(wx: number, wy: number): EcoRec {
     matSteps: 0,
     strikes: 0,
     lean: 0,
+    park: -1,
     flashKind: 0,
     flashUntil: 0,
   };
@@ -188,7 +191,10 @@ export class Biosphere {
     this.time += dt;
     if (this.recs.size > 16000) {
       for (const [k, r] of this.recs) {
-        if (r.mat < 0 && (Math.abs(r.wx - this.camX) > 320 || Math.abs(r.wy - this.camY) > 320)) this.recs.delete(k);
+        if (r.mat < 0 && (Math.abs(r.wx - this.camX) > 320 || Math.abs(r.wy - this.camY) > 320)) {
+          if (r.park >= 0) hooks.releasePark(r.park);
+          this.recs.delete(k);
+        }
       }
     }
     let feeds = 0;
@@ -209,6 +215,7 @@ export class Biosphere {
           r.flashKind = 3;
           r.flashUntil = this.time + 1.3;
           r.serial++;
+          r.matSerial = r.serial; // мор уже на GPU — пересев не нужен, жизнь не сбрасываем
           feed('extinct', r.wx, r.wy);
           if (r.strikes >= 3) this.extinct(r, hooks);
         } else if (r.mass < 0.002) {
@@ -222,6 +229,7 @@ export class Biosphere {
             r.flashKind = 2;
             r.flashUntil = this.time + 1.3;
             r.serial++;
+            r.matSerial = r.serial; // вирус уже на GPU — колония продолжает жить, а не перезаселяется
             feed('virus', r.wx, r.wy);
           } else if (Math.random() < 0.02 * dt) {
             this.mutate(r);
@@ -250,6 +258,10 @@ export class Biosphere {
         }
       } else if (Math.random() < 0.0016 * dt * this.aliveFrac(r)) {
         // зарождение жизни: мёртвое блюдцо оживает рядом с живыми
+        if (r.park >= 0) {
+          hooks.releasePark(r.park);
+          r.park = -1;
+        }
         r.sp = Math.floor(Math.random() * POND_LIST.length);
         r.pop = 1.4;
         r.strikes = 0;
@@ -324,6 +336,7 @@ export class Biosphere {
     r.mut[1] = cl(r.mut[1] * (1 + (Math.random() - 0.5) * 0.16), 0.86, 1.18);
     r.mut[2] = cl(r.mut[2] + Math.round((Math.random() - 0.5) * 2), -3, 3);
     r.serial++;
+    if (r.mat >= 0) r.matSerial = r.serial; // мутация меняет только параметры шага — без пересева
   }
 
   private emigrate(r: EcoRec, hooks: EcoHooks, feed: (k: FeedKind, x: number, y: number) => void) {
@@ -332,6 +345,10 @@ export class Biosphere {
     const ty = r.wy + (d === 2 ? 1 : d === 3 ? -1 : 0);
     const t = this.get(tx, ty);
     if (t.sp >= 0 && t.pop > 0.3) return;
+    if (t.park >= 0) {
+      hooks.releasePark(t.park);
+      t.park = -1;
+    }
     t.sp = r.sp;
     t.pop = 2.4;
     t.strikes = 0;
@@ -354,6 +371,10 @@ export class Biosphere {
     r.serial++;
     r.flashKind = 3;
     r.flashUntil = this.time + 1.3;
+    if (r.park >= 0) {
+      hooks.releasePark(r.park);
+      r.park = -1;
+    }
     if (r.mat >= 0) {
       hooks.clearSlot(r.mat);
       r.mat = -1;

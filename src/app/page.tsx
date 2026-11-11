@@ -207,8 +207,25 @@ export default function Page() {
     const metaOrgRef = { current: { x: 0, y: 0 } };
     const rsRef = { current: engine.softGL ? 0.5 : 1 }; // адаптивное разрешение рендера (медленным устройствам — меньше пикселей)
     const slotTable = new Map<number, EcoRec>();
+    const parkedRecs = new Map<number, EcoRec>();
     const freeSlots: number[] = [];
     for (let i = 0; i < S * S; i++) freeSlots.push(i);
+
+    const releaseParked = (r: EcoRec | null) => {
+      if (r && r.park >= 0) {
+        engine.releasePark(r.park);
+        parkedRecs.delete(r.park);
+        r.park = -1;
+      }
+    };
+    const seedSafe = (wx: number, wy: number, sp: number, pop: number) => {
+      releaseParked(world.peek(wx, wy));
+      world.seedDish(wx, wy, sp, pop);
+    };
+    const killSafe = (wx: number, wy: number) => {
+      releaseParked(world.peek(wx, wy));
+      world.killDish(wx, wy);
+    };
 
     /* ---- слоты: материализация видимых блюдц ---- */
 
@@ -218,6 +235,30 @@ export default function Page() {
     };
     const dropSlot = (slot: number, r: EcoRec) => {
       writeBack(r);
+      // жизнь не стирается — точное состояние паркуется на GPU и переживёт отдаление
+      if (r.sp >= 0 && r.mass > 0.002) {
+        let p = engine.park(slot);
+        if (p < 0 && parkedRecs.size > 0) {
+          let vk = -1;
+          let vd = -1;
+          for (const [pk, rec] of parkedRecs) {
+            const d = Math.abs(rec.wx - camRef.current.x) + Math.abs(rec.wy - camRef.current.y);
+            if (d > vd) {
+              vd = d;
+              vk = pk;
+            }
+          }
+          if (vk >= 0) {
+            parkedRecs.get(vk)!.park = -1;
+            parkedRecs.delete(vk);
+            p = engine.park(slot, vk);
+          }
+        }
+        if (p >= 0) {
+          r.park = p;
+          parkedRecs.set(p, r);
+        }
+      }
       slotTable.delete(slot);
       freeSlots.push(slot);
     };
@@ -270,6 +311,10 @@ export default function Page() {
       perturb: (slot: number, mode: number, seed: number) => engine.perturb(slot, mode, seed),
       clearSlot: (slot: number) => engine.clearSlot(slot),
       placeImmigrant: (slot: number, sp: number) => engine.place(slot, sp, Math.floor(Math.random() * 4), 16 + Math.random() * 64, 16 + Math.random() * 64),
+      releasePark: (p: number) => {
+        engine.releasePark(p);
+        parkedRecs.delete(p);
+      },
       feed: (kind: FeedKind, _wx: number, _wy: number) => pushFeed(kind, world.time, FEED_WORDS[kind]),
     };
 
@@ -313,7 +358,7 @@ export default function Page() {
       for (let wy = vy0; wy < vy1; wy++) {
         for (let wx = vx0; wx < vx1; wx++) {
           const sp = Math.floor(Math.random() * SPECIES.length);
-          world.seedDish(wx, wy, sp, 4 + Math.random() * 7);
+          seedSafe(wx, wy, sp, 4 + Math.random() * 7);
           if (real < 150 && wx >= wo.x && wy >= wo.y && wx < wo.x + S && wy < wo.y + S && cam.scale >= TEX_PX - 2) {
             const r = world.peek(wx, wy)!;
             if (r.mat < 0) {
@@ -346,7 +391,7 @@ export default function Page() {
         for (let wx = vx0; wx < vx1; wx++) {
           const r = world.peek(wx, wy);
           if (!r) continue;
-          world.killDish(wx, wy);
+          killSafe(wx, wy);
           if (r.mat >= 0) {
             const slot = r.mat;
             engine.clearSlot(slot);
@@ -527,7 +572,7 @@ export default function Page() {
         case 'KeyR':
         case 'KeyК': {
           const fd = focusDish();
-          world.seedDish(fd.x, fd.y, selRef.current, 3);
+          seedSafe(fd.x, fd.y, selRef.current, 3);
           guardRef.current = performance.now();
           break;
         }
@@ -738,10 +783,22 @@ export default function Page() {
                 } else {
                   matList.push({ slot: r.mat, r });
                 }
-              } else if (r.sp >= 0 && r.pop > 0.5 && cam.scale >= TEX_PX - 2 && ops < MAT_OPS) {
+              } else if (r.sp >= 0 && (r.park >= 0 || r.pop > 0.5) && cam.scale >= TEX_PX - 2 && ops < MAT_OPS) {
                 const slot = takeSlot(cdx, cdy);
                 if (slot < 0) {
                   ops = MAT_OPS;
+                } else if (r.park >= 0) {
+                  engine.unpark(r.park, slot); // жизнь пережила отдаление — возвращаем ту же самую
+                  parkedRecs.delete(r.park);
+                  r.park = -1;
+                  r.mat = slot;
+                  r.matSerial = r.serial;
+                  r.mass = Math.max(r.mass, 0.02);
+                  r.lean = 0;
+                  r.strikes = 0;
+                  slotTable.set(slot, r);
+                  ops++;
+                  matList.push({ slot, r });
                 } else {
                   engine.seedSlot(slot, r.sp, cnt(r));
                   r.mat = slot;
@@ -828,7 +885,7 @@ export default function Page() {
       matCount: () => slotTable.size,
       eco: (wx: number, wy: number) => {
         const r = world.get(wx, wy);
-        return { sp: r.sp, spName: r.sp >= 0 ? SPECIES[r.sp].ru : '-', pop: r.pop, mass: r.mass, clim: r.clim, mat: r.mat, serial: r.serial, mut: [...r.mut], time: world.time };
+        return { sp: r.sp, spName: r.sp >= 0 ? SPECIES[r.sp].ru : '-', pop: r.pop, mass: r.mass, clim: r.clim, mat: r.mat, park: r.park, serial: r.serial, mut: [...r.mut], time: world.time };
       },
       aliveNear: (rad: number) => world.aliveNear(rad),
       tick: (n = 1) => {
@@ -846,8 +903,10 @@ export default function Page() {
           r.matSteps += n;
         }
       },
-      seedDish: (wx: number, wy: number, sp: number, pop = 6) => world.seedDish(wx, wy, sp, pop),
-      killDish: (wx: number, wy: number) => world.killDish(wx, wy),
+      seedDish: (wx: number, wy: number, sp: number, pop = 6) => seedSafe(wx, wy, sp, pop),
+      killDish: (wx: number, wy: number) => killSafe(wx, wy),
+      parked: () => parkedRecs.size,
+      parkCap: () => engine.parkCapacity,
       perturb: (wx: number, wy: number, mode: number) => {
         const r = world.get(wx, wy);
         if (r.mat >= 0) engine.perturb(r.mat, mode, Math.random() * 100);
@@ -1161,7 +1220,7 @@ function Hud({ callbackRef }: { callbackRef: { current: (s: HudSnap) => void } }
 
   return (
     <div className="pointer-events-none absolute left-[max(0.75rem,env(safe-area-inset-left))] top-[max(0.75rem,env(safe-area-inset-top))] z-10 flex max-w-[54vw] flex-col gap-1.5">
-      <div className="rounded-2xl border border-emerald-500/25 bg-black/55 px-3 py-1.5 backdrop-blur">
+      <div data-testid="hud-card" className="rounded-2xl border border-emerald-500/25 bg-black/55 px-3 py-1.5 backdrop-blur [@media(pointer:coarse)]:hidden [@media(max-width:767px)]:hidden">
         <div className="flex items-baseline gap-2">
           <p data-testid="pop-count" className="text-xl font-extrabold leading-none tabular-nums text-neutral-100">
             {snap.pop}

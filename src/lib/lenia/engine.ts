@@ -269,19 +269,26 @@ void main() {
   float tw = 0.88 + 0.12 * tri(uTime * uSpeed * (0.03 + 0.03 * h1) + h1 * 3.0);
 
   ivec2 sc = di - uWin;
-  bool textured = mat && sc.x >= 0 && sc.y >= 0 && sc.x < uSlots && sc.y < uSlots && uScale > ${TEX_PX}.0;
-  vec3 col;
+  bool canTex = mat && sc.x >= 0 && sc.y >= 0 && sc.x < uSlots && sc.y < uSlots;
+  bool textured = canTex && uScale > ${TEX_PX}.0;
+  // статистический слой: круглый сгусток жизни вместо сплошной заливки
+  vec3 colStat = water;
+  if (sp >= 0) {
+    float l = clamp(life * tw, 0.0, 1.0);
+    if (l > 0.03) {
+      float dl = length(f - vec2(0.5));
+      float rad = max(0.20, l * 0.55);
+      float colony = 1.0 - smoothstep(rad - 0.16, rad + 0.06, dl);
+      colStat = max(colStat, palette(sp, 0.2 + 0.8 * l) * (0.30 + 0.70 * l) * (0.30 + 0.70 * colony));
+    }
+  }
+  vec3 col = colStat;
   if (textured) {
     float v = field(sc * 96, f);
     float sh = v * v * (3.0 - 2.0 * v); // органичная пластика вместо пикселей
     float vis = smoothstep(0.02, 0.12, v); // пустая вода не заливается цветом палитры
-    col = sp >= 0 ? mix(water, palette(sp, pow(sh, uGamma)), vis) : water;
-  } else {
-    col = water;
-    if (sp >= 0) {
-      float l = clamp(life * tw, 0.0, 1.0);
-      if (l > 0.03) col = max(col, palette(sp, 0.2 + 0.8 * l) * (0.35 + 0.65 * l));
-    }
+    vec3 colTex = sp >= 0 ? mix(water, palette(sp, pow(sh, uGamma)), vis) : water;
+    col = mix(colStat, colTex, smoothstep(${TEX_PX}.0, ${TEX_PX + 14}.0, uScale)); // мягкий LOD-переход
   }
 
   vec2 dpx = min(f, 1.0 - f) * uScale;
@@ -338,7 +345,10 @@ function program(gl: WebGL2RenderingContext, fragSrc: string): WebGLProgram {
 
 export class PondEngine {
   readonly slots: number; // сторона пула (S×S блюдц)
-  readonly atlas: number;
+  readonly atlasW: number; // ширина атласа (слоты)
+  readonly atlasH: number; // высота атласа (слоты + строки парковки)
+  readonly parkRows: number; // строк парковки состояний (зум без потерь)
+  private parkFree: number[] = [];
   readonly speciesList: Creature[];
   readonly softGL: boolean; // программный рендер (SwiftShader/llvmpipe) — беречь
 
@@ -386,7 +396,10 @@ export class PondEngine {
     let slots = 20;
     if (maxTex < 2048 || (dm && dm <= 4)) slots = 12; // слабым устройствам — меньший атлас R32F
     this.slots = slots;
-    this.atlas = slots * DISH;
+    this.parkRows = Math.max(0, Math.min(6, Math.floor(maxTex / DISH) - slots)); // запасные строки — парковка состояний
+    this.atlasW = slots * DISH;
+    this.atlasH = (slots + this.parkRows) * DISH;
+    for (let p = 0; p < this.parkRows * slots; p++) this.parkFree.push(p);
 
     this.speciesList = POND_LIST;
     this.norms = this.speciesList.map((c) => kernelNorm(c.R, c.b, c.kn));
@@ -413,7 +426,7 @@ export class PondEngine {
     for (let i = 0; i < 2; i++) {
       const t = gl.createTexture()!;
       gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, this.atlas, this.atlas, 0, gl.RED, gl.FLOAT, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, this.atlasW, this.atlasH, 0, gl.RED, gl.FLOAT, null);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -421,7 +434,7 @@ export class PondEngine {
       const f = gl.createFramebuffer()!;
       gl.bindFramebuffer(gl.FRAMEBUFFER, f);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
-      gl.viewport(0, 0, this.atlas, this.atlas);
+      gl.viewport(0, 0, this.atlasW, this.atlasH);
       gl.clearColor(0, 0, 0, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
       this.tex.push(t);
@@ -533,6 +546,50 @@ export class PondEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, ox, oy, DISH, DISH, gl.RED, gl.FLOAT, this.zeroTile);
+  }
+
+  get parkCapacity(): number {
+    return this.parkRows * this.slots;
+  }
+
+  /** Спрятать живое состояние слота в парковку (GPU→GPU, без чтения в CPU). */
+  park(slot: number, into = -1): number {
+    const p = into >= 0 ? into : this.parkFree.length ? this.parkFree.pop()! : -1;
+    if (p < 0) return -1;
+    this.copyRegion(this.slots * this.slots + p, slot);
+    return p;
+  }
+
+  /** Вернуть состояние из парковки в слот и освободить место. */
+  unpark(parkIdx: number, slot: number) {
+    this.copyRegion(slot, this.slots * this.slots + parkIdx);
+    this.releasePark(parkIdx);
+  }
+
+  /** Освободить парковочное место, не возвращая состояние. */
+  releasePark(parkIdx: number) {
+    if (this.parkFree.indexOf(parkIdx) < 0) this.parkFree.push(parkIdx);
+  }
+
+  /** Копировать область 96×96 между слотами атласа (через скретч, GPU→GPU). */
+  private copyRegion(dstSlot: number, srcSlot: number) {
+    const gl = this.gl;
+    const [sx, sy] = this.slotOrigin(srcSlot);
+    const [dx, dy] = this.slotOrigin(dstSlot);
+    gl.useProgram(this.progCopy);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
+    gl.uniform1i(this.uni(this.progCopy, 'uSrc'), 0);
+    gl.uniform2i(this.uni(this.progCopy, 'uOffset'), sx, sy);
+    gl.viewport(0, 0, DISH, DISH);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindTexture(gl.TEXTURE_2D, this.scratchTex);
+    gl.uniform2i(this.uni(this.progCopy, 'uOffset'), -dx, -dy);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[0]);
+    gl.viewport(dx, dy, DISH, DISH);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   /** Материализовать блюдце: очистить и поселить count организмов. */
