@@ -1,19 +1,23 @@
 /**
  * Биосфера планеты блюдцев: 2000×2000 блюдцев, жизнь — разреженная карта.
  *
- * Каждое блюдце — экосистема на 200 организмов (DISH_CAP). Организмы
- * чувствуют стены своего блюдца и не пересекают их, пока блюдце не
- * заполнится completely — заполненное блюдце с соблюдением паузы
- * («emitAt») переливается в соседние: колонисты появляются у стены
- * соседнего блюдца, как будто перебрались через неё. Пустое блюдце
- * колонизируется, своё получает подкрепление, чужое — войну за территорию.
+ * Жизнь зарождается ОДНИМ видом в ОДНОМ блюдце (за всю историю планеты
+ * 1–2 искры). Дальше всё делает эволюция: колонии мутируют, дивергенция
+ * линии накапливается — и в какой-то момент популяция превращается в
+ * НОВЫЙ ВИД со своим именем, цветом и характером. Хищники охотятся на
+ * соседей и завоевывают их блюдца, симбионты поддерживают друг друга и
+ * рождают гибридов, репликаторы (грибы) — фабрика новых видов. Виды
+ * вымирают — до последнего блюдца.
+ *
+ * Характер вида — четыре черты: агрессия (охота, завоевание), броня
+ * (стойкость к болезням и хищникам), мутабельность (скорость эволюции),
+ * симбиоз (дружба и гибриды). Черты наследуются с вариацией, так что
+ * каждый вид реально уникален. Черты исконных видов подобраны по их
+ * натуре из оригинального зоопарка Lenia.
  *
  * Честная Lenia течёт в материализованных блюдцах (слоты движка), их
- * популяции синхронизируются из LOD-текстуры (syncMasses). Остальная
- * планета живёт статистически — логистический рост, вирусы от скученности,
- * встречи видов на фронтире, вымирания. Климата нет: эволюция — только
- * через взаимодействие существ. Механики проверены NumPy
- * (scripts/verify_evolution.py).
+ * популяции синхронизируются из LOD-текстуры (syncMasses). Болезни гасят
+ * колонию постепенно — тик за тиком, а не стирают блюдце за один кадр.
  */
 
 import { POND_LIST } from './creatures';
@@ -21,20 +25,82 @@ import { DISH, META, WORLD, LOD_N } from './engine';
 
 export { WORLD };
 
-/** Ёмкость блюдца: столько организмов живёт в одном блюдце. */
+/** Ёмкость блюдца: абсолютный потолок организмов. */
 export const DISH_CAP = 200;
-/** Популяция «блюдце заполнено» — пора переливаться в соседей. */
-const FULL_POP = DISH_CAP - 6;
 /** Популяция из покрытия: масса 0.5 ≈ 200 существ. */
 export const POP_PER_MASS = (DISH * DISH) / 25;
+/** Максимум видов на планете: 6 бит в мета-текстуре (spEnc 1..63). */
+export const SPECIES_MAX = 62;
+
+/** Характер вида — наследуемые черты. */
+export interface Traits {
+  aggression: number; // охота и завоевание чужих блюдц
+  armor: number; // стойкость к болезням и хищникам
+  mutability: number; // скорость накопления дивергенции
+  symbiosis: number; // дружба с соседями, гибриды
+}
+
+export type SpeciesRole = 'хищник' | 'сеятель видов' | 'симбионт' | 'броненосец' | 'мирный';
+
+/** Вид: исконный или рождённый эволюцией. */
+export interface SpeciesRec {
+  id: number; // 0..61 — кодируется в мета-текстуре
+  base: number; // тело вида — индекс в POND_LIST
+  parent: number; // вид-предок (-1 — исконный)
+  gen: number; // глубина эволюции
+  name: string;
+  role: SpeciesRole;
+  m: number;
+  s: number;
+  T: number; // параметры шага Lenia линии
+  spill: number; // популяция «блюдце переполнено»
+  traits: Traits;
+  born: number; // мировое время рождения
+  alive: number; // живых блюдц (пересчитывается каждый тик)
+  hadAlive: boolean; // был ли вид жив на прошлом тике
+  extinctAt: number; // время вымирания (0 — жив или не рождался)
+}
+
+/** Черты исконных видов — по натуре существ из зоопарка Lenia. */
+const BASE_TRAITS: Traits[] = [
+  /* Головастик */ { aggression: 0.7, armor: 0.3, mutability: 0.3, symbiosis: 0.1 },
+  /* Жук         */ { aggression: 0.8, armor: 0.2, mutability: 0.35, symbiosis: 0.05 },
+  /* Волчок      */ { aggression: 0.15, armor: 0.7, mutability: 0.25, symbiosis: 0.2 },
+  /* Щит         */ { aggression: 0.25, armor: 0.85, mutability: 0.2, symbiosis: 0.15 },
+  /* Крониум     */ { aggression: 0.3, armor: 0.8, mutability: 0.15, symbiosis: 0.2 },
+  /* Призрак     */ { aggression: 0.75, armor: 0.15, mutability: 0.4, symbiosis: 0.05 },
+  /* Спираль     */ { aggression: 0.2, armor: 0.6, mutability: 0.5, symbiosis: 0.35 },
+  /* Пила        */ { aggression: 0.9, armor: 0.35, mutability: 0.3, symbiosis: 0.0 },
+  /* Странник    */ { aggression: 0.35, armor: 0.4, mutability: 0.45, symbiosis: 0.5 },
+  /* Цветок      */ { aggression: 0.05, armor: 0.45, mutability: 0.55, symbiosis: 0.8 },
+  /* Гриб        */ { aggression: 0.1, armor: 0.5, mutability: 0.95, symbiosis: 0.3 },
+];
+
+/** Переполнение блюдца по видам: грибы заполняют всё, глайдеры — патрулируют. */
+const BASE_SPILL = [34, 30, 48, 52, 50, 32, 46, 36, 34, 42, DISH_CAP - 6];
+
+/** Видовые эпитеты для имён эволюционных линий. */
+const SUFFIX = [
+  'прибрежный', 'глубинный', 'стремительный', 'тихий', 'крепкий', 'малый', 'великий', 'пятнистый',
+  'ночной', 'светлый', 'тёмный', 'южный', 'северный', 'древний', 'новый', 'стеклянный',
+  'дымчатый', 'колючий', 'лунный', 'быстрый', 'медленный', 'резкий', 'мягкий', 'сонный',
+];
+
+function roleOf(t: Traits): SpeciesRole {
+  if (t.mutability >= 0.7) return 'сеятель видов';
+  if (t.aggression >= 0.6) return 'хищник';
+  if (t.symbiosis >= 0.6) return 'симбионт';
+  if (t.armor >= 0.65) return 'броненосец';
+  return 'мирный';
+}
 
 export interface EcoRec {
   wx: number;
   wy: number;
-  sp: number; // индекс вида в POND_LIST (мёртвых блюдцев нет в карте)
-  pop: number; // популяция (организмов, до ~220)
+  sp: number; // id вида в таблице species (мёртвых блюдцев нет в карте)
+  pop: number; // популяция (организмов)
   mass: number; // покрытие блюдца 0..1 (последняя проба GPU)
-  mut: [number, number, number]; // dm, ds, dT — накопленные мутации линии
+  div: number; // дивергенция линии 0..1 — накопленная эволюция
   mat: number; // слот движка или -1
   serial: number; // растёт при любом изменении экосистемы
   matSerial: number; // serial на момент материализации
@@ -42,17 +108,29 @@ export interface EcoRec {
   lean: number; // подряд голодных проб
   emitAt: number; // мировое время следующего переливания (блюдце полно)
   fromDir: number; // стена, через которую пришла колония (-1 — своя)
-  flashKind: number; // 0 нет, 1 рождение, 2 вирус, 3 гибель
+  sickUntil: number; // мировое время конца болезни (0 — здорова)
+  sickK: number; // множитель угасания за тик болезни
+  flashKind: number; // 0 нет, 1 рождение, 2 болезнь, 3 гибель, 4 новый вид, 5 симбиоз
   flashUntil: number; // мировое время конца вспышки
 }
 
-export type FeedKind = 'virus' | 'mut' | 'spread' | 'origin' | 'extinct';
+export type FeedKind =
+  | 'virus'
+  | 'mut'
+  | 'spread'
+  | 'origin'
+  | 'extinct'
+  | 'speciate'
+  | 'hybrid'
+  | 'conquest'
+  | 'symbiosis'
+  | 'hunt';
 
 export interface EcoHooks {
-  perturb(slot: number, mode: number, seed: number): void;
+  perturb(slot: number, mode: number, seed: number, k?: number): void;
   clearSlot(slot: number): void;
   placeImmigrant(slot: number, sp: number, fromDir: number): void;
-  feed(kind: FeedKind, wx: number, wy: number): void;
+  feed(kind: FeedKind, wx: number, wy: number, text?: string): void;
 }
 
 interface OriginPlan {
@@ -60,38 +138,19 @@ interface OriginPlan {
   wy: number;
   sp: number;
   at: number; // мировое время зарождения
-  mut: [number, number, number];
 }
 
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
-
-/** Целочисленный хэш координат → [0,1). Стабилен между сессиями. */
-export function hash01(x: number, y: number, s: number): number {
-  let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1442695041)) | 0;
-  h = Math.imul(h ^ (h >>> 13), 1274126177);
-  h ^= h >>> 16;
-  return (h >>> 0) / 4294967296;
-}
 
 const DX = [1, -1, 0, 0];
 const DY = [0, 0, 1, -1];
 const OPP = [1, 0, 3, 2];
 
-/** Параметры шага Lenia для блюдца: вид + мутации линии. Климата нет —
- *  эволюция идёт только через взаимодействие существ. */
-export function dishParams(r: EcoRec): { sp: number; m: number; s: number; T: number } {
-  const c = POND_LIST[r.sp];
-  return {
-    sp: r.sp,
-    m: c.m + r.mut[0],
-    s: c.s * r.mut[1],
-    T: Math.max(1, Math.round(c.T + r.mut[2])),
-  };
-}
-
 export class Biosphere {
   /** Живые блюдца планеты: ключ = wy*WORLD+wx. Мёртвых нет в карте. */
   readonly recs = new Map<number, EcoRec>();
+  /** Таблица видов: id → вид (null — слот свободен). */
+  readonly species: (SpeciesRec | null)[] = [];
   time = 0;
   private camX = WORLD / 2;
   private camY = WORLD / 2;
@@ -99,59 +158,78 @@ export class Biosphere {
   private shadow = new Uint8Array(META * META * 4);
   private dirtyRows = new Set<number>();
   private schedule: OriginPlan[] = [];
+  private suffixIdx = 0;
+  private speciesFree: number[] = [];
+  private nextSpeciateAt = 0; // кулдаун видообразования: новый вид успевает расплодиться
 
   constructor() {
     this.reset();
   }
 
-  /** Новая игра: мёртвая планета + расписание зарождений жизни. */
+  /** Новая игра: мёртвая планета, исконные виды, расписание зарождения. */
   reset() {
     this.time = 0;
     this.recs.clear();
+    this.species.length = 0;
+    this.suffixIdx = 0;
     this.meta.fill(0);
     this.shadow.fill(0);
     this.dirtyRows.clear();
+    // исконные виды 0..10 — тела и проверенные параметры из зоопарка
+    POND_LIST.forEach((c, i) => {
+      this.species[i] = {
+        id: i,
+        base: i,
+        parent: -1,
+        gen: 0,
+        name: c.ru,
+        role: roleOf(BASE_TRAITS[i]),
+        m: c.m,
+        s: c.s,
+        T: c.T,
+        spill: BASE_SPILL[i],
+        traits: { ...BASE_TRAITS[i] },
+        born: 0,
+        alive: 0,
+        hadAlive: false,
+        extinctAt: 0,
+      };
+    });
+    for (let i = POND_LIST.length; i < SPECIES_MAX; i++) this.species[i] = null;
+    this.speciesFree = [];
+    for (let i = SPECIES_MAX - 1; i >= POND_LIST.length; i--) this.speciesFree.push(i);
     this.makeSchedule();
   }
 
-  /** Колонии зарождения: далеко друг от друга, в разное время, разные виды
-   *  и разные мутации — у каждой линии своя эволюция. Первая — недалеко от
-   *  центра планеты, чтобы её было видно с обзорного зума. */
+  /** История планеты: 1–2 зарождения жизни — одно сразу, вторая искра
+   *  спустя долгое время, далеко от первой, с поиском свободного места.
+   *  Эволюция остальных видов — только через мутации, войны и гибриды. */
   private makeSchedule() {
     const c = WORLD / 2;
-    const pts: { wx: number; wy: number }[] = [
-      { wx: Math.round(c + (Math.random() - 0.5) * 160), wy: Math.round(c + (Math.random() - 0.5) * 160) },
-    ];
-    for (let minDist = 600; minDist >= 300 && pts.length < 7; minDist -= 100) {
-      let guard = 0;
-      while (pts.length < 7 && guard++ < 4000) {
-        const wx = 2 + Math.floor(Math.random() * (WORLD - 4));
-        const wy = 2 + Math.floor(Math.random() * (WORLD - 4));
-        if (pts.every((p) => Math.hypot(p.wx - wx, p.wy - wy) >= minDist)) pts.push({ wx, wy });
+    const o1 = {
+      wx: Math.round(c + (Math.random() - 0.5) * 160),
+      wy: Math.round(c + (Math.random() - 0.5) * 160),
+    };
+    const sp1 = Math.floor(Math.random() * POND_LIST.length);
+    const plans: OriginPlan[] = [{ wx: o1.wx, wy: o1.wy, sp: sp1, at: 2 + Math.random() * 4 }];
+    if (Math.random() < 0.75) {
+      let wx = o1.wx;
+      let wy = o1.wy;
+      for (let guard = 0; guard < 4000 && Math.hypot(wx - o1.wx, wy - o1.wy) < 700; guard++) {
+        wx = 2 + Math.floor(Math.random() * (WORLD - 4));
+        wy = 2 + Math.floor(Math.random() * (WORLD - 4));
       }
+      let sp2 = Math.floor(Math.random() * POND_LIST.length);
+      if (sp2 === sp1) sp2 = (sp2 + 1 + Math.floor(Math.random() * (POND_LIST.length - 1))) % POND_LIST.length;
+      plans.push({ wx, wy, sp: sp2, at: 120 + Math.random() * 120 });
     }
-    const times: number[] = [2 + Math.random() * 4];
-    for (let i = 1; i < pts.length; i++) times.push(15 + Math.random() * 225); // до ~4 минут
-    times.sort((a, b) => a - b);
-    const species = [...POND_LIST.keys()];
-    for (let i = species.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [species[i], species[j]] = [species[j], species[i]];
-    }
-    this.schedule = pts.map((p, i) => ({
-      wx: p.wx,
-      wy: p.wy,
-      sp: species[i % species.length],
-      at: times[i],
-      mut: [(Math.random() - 0.5) * 0.012, 0.96 + Math.random() * 0.08, Math.round((Math.random() - 0.5) * 2)],
-    }));
+    this.schedule = plans;
   }
 
   key(wx: number, wy: number): number {
     return wy * WORLD + wx;
   }
 
-  /** Запись блюдца (за пределами планеты — null). */
   peek(wx: number, wy: number): EcoRec | null {
     if (!this.inWorld(wx, wy)) return null;
     return this.recs.get(this.key(wx, wy)) ?? null;
@@ -182,34 +260,102 @@ export class Biosphere {
     return n;
   }
 
-  private fresh(wx: number, wy: number, sp: number, pop: number, mut: [number, number, number]): EcoRec {
-    return {
-      wx,
-      wy,
-      sp,
-      pop,
-      mass: clamp(pop / POP_PER_MASS, 0, 1),
-      mut,
-      mat: -1,
-      serial: 1,
-      matSerial: 0,
-      matSteps: 0,
-      lean: 0,
-      emitAt: this.time + 25 + Math.random() * 20,
-      fromDir: -1,
-      flashKind: 1,
-      flashUntil: this.time + 1.3,
-    };
+  aliveSpeciesCount(): number {
+    let n = 0;
+    for (const s of this.species) if (s && s.alive > 0) n++;
+    return n;
   }
 
-  /** Заселить блюдце видом (кнопка «Заселить», посадка, сброс). */
+  /** Таблица видов (для HUD и отладки). */
+  speciesInfo(id: number): SpeciesRec | null {
+    return this.species[id] ?? null;
+  }
+
+  speciesName(id: number): string {
+    return this.species[id]?.name ?? '—';
+  }
+
+  speciesRole(id: number): string {
+    return this.species[id]?.role ?? '';
+  }
+
+  speciesBase(id: number): number {
+    return this.species[id]?.base ?? 0;
+  }
+
+  speciesT(id: number): number {
+    return this.species[id]?.T ?? 10;
+  }
+
+  private sp(id: number): SpeciesRec {
+    const s = this.species[id];
+    if (!s) throw new Error(`вид ${id} не существует`);
+    return s;
+  }
+
+  /** Параметры шага Lenia для блюдца: тело вида + параметры линии. */
+  dishParams(r: EcoRec): { sp: number; m: number; s: number; T: number } {
+    const s = this.sp(r.sp);
+    return { sp: s.base, m: s.m, s: s.s, T: s.T };
+  }
+
+  /** Родить новый вид от родителя: параметры — маленький шаг эволюции
+   *  в пределах безопасной полосы вокруг исконных (жизнеспособность),
+   *  черты — наследие с вариацией. null — таблица видов переполнена. */
+  private newSpecies(parent: SpeciesRec): SpeciesRec | null {
+    let id = this.speciesFree.pop();
+    if (id === undefined) {
+      // переиспользуем слот давно вымершего вида
+      let best: SpeciesRec | null = null;
+      for (const s of this.species) {
+        if (s && s.alive === 0 && s.hadAlive && s.extinctAt > 0 && this.time - s.extinctAt > 180) {
+          if (!best || s.extinctAt < best.extinctAt) best = s;
+        }
+      }
+      if (!best) return null;
+      id = best.id;
+    }
+    const base = POND_LIST[parent.base];
+    const m = clamp(parent.m + (Math.random() - 0.5) * 0.03, base.m - Math.min(0.04, 0.12 * base.m), base.m + Math.min(0.04, 0.12 * base.m));
+    const s = clamp(parent.s * (1 + (Math.random() - 0.5) * 0.1), base.s * 0.93, base.s * 1.13);
+    const T = Math.max(1, Math.round(parent.T + (Math.random() - 0.5) * 2));
+    const traits: Traits = {
+      aggression: clamp(parent.traits.aggression + (Math.random() - 0.5) * 0.28, 0.03, 0.97),
+      armor: clamp(parent.traits.armor + (Math.random() - 0.5) * 0.28, 0.03, 0.97),
+      mutability: clamp(parent.traits.mutability + (Math.random() - 0.5) * 0.3, 0.03, 0.97),
+      symbiosis: clamp(parent.traits.symbiosis + (Math.random() - 0.5) * 0.28, 0.02, 0.97),
+    };
+    let name = `${base.ru} ${SUFFIX[this.suffixIdx++ % SUFFIX.length]}`;
+    if (this.species.some((x) => x && x.name === name)) name += `-${parent.gen + 1}`;
+    const rec: SpeciesRec = {
+      id,
+      base: parent.base,
+      parent: parent.id,
+      gen: parent.gen + 1,
+      name,
+      role: roleOf(traits),
+      m,
+      s,
+      T,
+      spill: clamp(parent.spill + (Math.random() - 0.5) * 30, 24, DISH_CAP - 6),
+      traits,
+      born: this.time,
+      alive: 0,
+      hadAlive: false,
+      extinctAt: 0,
+    };
+    this.species[id] = rec;
+    return rec;
+  }
+
+  /** Заселить блюдце видом (зарождение жизни, посадка, сброс). */
   seedDish(wx: number, wy: number, sp: number, pop: number) {
-    if (!this.inWorld(wx, wy)) return;
+    if (!this.inWorld(wx, wy) || !this.species[sp]) return;
     const k = this.key(wx, wy);
     const old = this.recs.get(k);
     const r: EcoRec = old
-      ? { ...old, sp, pop, mass: clamp(pop / POP_PER_MASS, 0, 1), lean: 0, serial: old.serial + 1, flashKind: 1, flashUntil: this.time + 1.3 }
-      : this.fresh(wx, wy, sp, pop, [0, 1, 0]);
+      ? { ...old, sp, pop, mass: clamp(pop / POP_PER_MASS, 0, 1), div: 0, sickUntil: 0, lean: 0, serial: old.serial + 1, flashKind: 1, flashUntil: this.time + 1.3 }
+      : this.fresh(wx, wy, sp, pop);
     this.recs.set(k, r);
   }
 
@@ -246,66 +392,110 @@ export class Biosphere {
   tick(dt: number, hooks: EcoHooks) {
     this.time += dt;
 
-    // расписание зарождений: жизнь появляется в отдалённых блюдцах
+    // расписание зарождений: редкие искры жизни в пустом мире.
+    // Занято намеченное блюдце — ищем ближайшее свободное, искра не пропадает
     while (this.schedule.length > 0 && this.schedule[0].at <= this.time) {
       const o = this.schedule.shift()!;
-      const k = this.key(o.wx, o.wy);
-      if (!this.recs.has(k)) {
-        this.recs.set(k, this.fresh(o.wx, o.wy, o.sp, 6, [...o.mut]));
-        hooks.feed('origin', o.wx, o.wy);
+      let wx = o.wx;
+      let wy = o.wy;
+      if (this.recs.has(this.key(wx, wy))) {
+        let found = false;
+        for (let rad = 1; rad <= 30 && !found; rad++) {
+          for (let dy = -rad; dy <= rad && !found; dy++) {
+            for (let dx = -rad; dx <= rad; dx++) {
+              if (Math.max(Math.abs(dx), Math.abs(dy)) !== rad) continue;
+              if (!this.inWorld(wx + dx, wy + dy) || this.recs.has(this.key(wx + dx, wy + dy))) continue;
+              wx += dx;
+              wy += dy;
+              found = true;
+            }
+          }
+        }
+        if (!found) continue;
       }
+      this.recs.set(this.key(wx, wy), this.fresh(wx, wy, o.sp, 6));
+      hooks.feed('origin', wx, wy, `жизнь зародилась: ${this.sp(o.sp).name.toLowerCase()}`);
     }
 
     let feeds = 0;
-    const feed = (kind: FeedKind, wx: number, wy: number) => {
-      if (feeds >= 3) return;
-      if (Math.abs(wx - this.camX) > 60 || Math.abs(wy - this.camY) > 60) return;
-      feeds++;
-      hooks.feed(kind, wx, wy);
+    const feed = (kind: FeedKind, wx: number, wy: number, text?: string) => {
+      // видообразование, гибриды и завоевания — всегда в ленту
+      if (kind !== 'speciate' && kind !== 'hybrid' && kind !== 'conquest') {
+        if (feeds >= 3) return;
+        if (Math.abs(wx - this.camX) > 60 || Math.abs(wy - this.camY) > 60) return;
+        feeds++;
+      }
+      hooks.feed(kind, wx, wy, text);
     };
 
     for (const r of [...this.recs.values()]) {
+      const s = this.sp(r.sp);
+
+      // болезнь: колония гаснет постепенно, тик за тиком — без обнулений
+      if (r.sickUntil > this.time) {
+        const kEff = Math.pow(r.sickK, dt / 0.5);
+        if (r.mat >= 0) hooks.perturb(r.mat, 2, Math.random() * 100, kEff);
+        r.pop *= kEff;
+        r.mass *= kEff;
+      }
+
+      // скученность вида: монокультура соседних блюдц — рассадник болезней
+      let sameN = 0;
+      for (let d = 0; d < 4; d++) {
+        const n = this.recs.get(this.key(r.wx + DX[d], r.wy + DY[d]));
+        if (n && n.sp === r.sp) sameN++;
+      }
+      const plague = 0.0004 + 0.0007 * sameN;
+
       if (r.mat >= 0) {
         // материализованное блюдце: жизнь течёт честной Lenia на GPU
         if (r.mass < 0.0018) {
-          if (++r.lean >= 4) this.extinct(r, hooks, feed);
-          continue;
-        }
-        r.lean = 0;
-        if (r.pop >= FULL_POP && this.time >= r.emitAt) {
-          // блюдце заполнено организмами — колония переливается в соседей
-          r.emitAt = this.time + 3 + Math.random() * 4;
-          this.emigrate(r, hooks, feed);
-        } else if (Math.random() < 0.0035 * dt * Math.pow(r.pop / DISH_CAP, 2)) {
-          // вирус от скученности — редкий и мягкий, без мгновенной смерти
-          hooks.perturb(r.mat, 1, Math.random() * 100);
-          r.mass *= 0.55;
-          r.flashKind = 2;
-          r.flashUntil = this.time + 1.3;
-          r.serial++;
-          r.matSerial = r.serial; // вирус уже на GPU — колония продолжает жить
-          feed('virus', r.wx, r.wy);
-        } else if (Math.random() < 0.004 * dt * (r.pop / 100)) {
-          this.mutate(r);
-          feed('mut', r.wx, r.wy);
+          if (++r.lean >= 4) {
+            this.extinct(r, hooks, feed);
+            continue;
+          }
+        } else {
+          r.lean = 0;
+          if (r.pop >= s.spill - 6 && this.time >= r.emitAt) {
+            // блюдце заполнено организмами — колония переливается в соседей
+            r.emitAt = this.time + 3 + Math.random() * 4;
+            this.emigrate(r, hooks, feed);
+          } else if (Math.random() < (plague * dt * Math.pow(Math.min(1, r.pop / s.spill), 2)) / (0.4 + s.traits.armor)) {
+            // болезнь от скученности: заражение + постепенное угасание
+            hooks.perturb(r.mat, 1, Math.random() * 100);
+            this.sicken(r, 2.0 + Math.random() * 1.2, 0.8);
+            r.flashKind = 2;
+            r.flashUntil = this.time + 1.3;
+            r.serial++;
+            r.matSerial = r.serial; // заражение уже на GPU — колония продолжает жить
+            feed('virus', r.wx, r.wy);
+          } else if (Math.random() < 0.01 * dt * (0.25 + Math.min(1.5, r.pop / 100)) * (0.5 + s.traits.mutability)) {
+            this.evolve(r, feed);
+          }
         }
       } else {
-        // статистическое блюдце: мягкая логистика до ёмкости
-        r.pop += (0.16 * r.pop * (1 - r.pop / DISH_CAP) + (Math.random() - 0.5) * 0.6) * dt;
+        // статистическое блюдце: мягкая логистика до ёмкости вида
+        const cap = s.spill;
+        r.pop += (0.16 * r.pop * (1 - r.pop / cap) + (Math.random() - 0.5) * 0.6) * dt;
         if (r.pop < 0.3) {
           this.extinct(r, hooks, feed);
           continue;
         }
-        if (r.pop >= FULL_POP && this.time >= r.emitAt) {
+        if (r.pop >= cap - 6 && this.time >= r.emitAt) {
           r.emitAt = this.time + 3 + Math.random() * 4;
           this.emigrate(r, hooks, feed);
-        } else if (Math.random() < 0.00012 * dt * (r.pop / DISH_CAP)) {
-          this.spark(r, feed); // рядом оживает независимый вид
+        } else if (Math.random() < (plague * dt * (r.pop / cap)) / (0.4 + s.traits.armor)) {
+          this.sicken(r, 2.4, 0.72);
+          r.flashKind = 2;
+          r.flashUntil = this.time + 1.3;
+          feed('virus', r.wx, r.wy);
+        } else if (Math.random() < 0.01 * dt * (0.25 + Math.min(1.5, r.pop / 100)) * (0.5 + s.traits.mutability)) {
+          this.evolve(r, feed);
         }
       }
     }
 
-    // фронтир: встретившиеся виды влияют друг на друга
+    // фронтир: встретившиеся виды вступают в отношения — война или симбиоз
     for (const a of this.recs.values()) {
       for (let d = 0; d < 2; d++) {
         const tx = a.wx + (d === 0 ? 1 : 0);
@@ -313,46 +503,147 @@ export class Biosphere {
         if (!this.inWorld(tx, ty)) continue;
         const b = this.recs.get(this.key(tx, ty));
         if (!b || b.sp === a.sp) continue;
-        if (Math.random() < 0.02 * dt) {
-          const weak = a.pop <= b.pop ? a : b; // болезнь бьёт по плотнейшему
-          if (weak.mat >= 0) {
-            hooks.perturb(weak.mat, 1, Math.random() * 100);
-            weak.mass *= 0.55;
-            weak.serial++;
-            weak.matSerial = weak.serial;
-          } else {
-            weak.pop *= 0.55;
-          }
-          weak.flashKind = 2;
-          weak.flashUntil = this.time + 1.3;
-          feed('virus', weak.wx, weak.wy);
-        }
+        if (Math.random() < 0.02 * dt) this.conflict(a, b, hooks, feed);
       }
+    }
+
+    // учёт видов: вид вымирает, когда погибло его последнее блюдце
+    for (const s of this.species) if (s) s.alive = 0;
+    for (const r of this.recs.values()) this.sp(r.sp).alive++;
+    for (const s of this.species) {
+      if (!s) continue;
+      if (s.hadAlive && s.alive === 0) {
+        s.extinctAt = this.time;
+        hooks.feed('extinct', this.camX, this.camY, `вид погиб: ${s.name.toLowerCase()}`);
+      }
+      s.hadAlive = s.alive > 0;
     }
   }
 
-  /** Рядом с живым блюдцем оживает независимый вид — своя эволюция. */
-  private spark(r: EcoRec, feed: (k: FeedKind, x: number, y: number) => void) {
-    const d = Math.floor(Math.random() * 4);
-    const tx = r.wx + DX[d];
-    const ty = r.wy + DY[d];
-    if (!this.inWorld(tx, ty) || this.recs.has(this.key(tx, ty))) return;
-    this.recs.set(this.key(tx, ty), this.fresh(tx, ty, Math.floor(Math.random() * POND_LIST.length), 1.6, [0, 1, 0]));
-    feed('origin', tx, ty);
+  private sicken(r: EcoRec, dur: number, k: number) {
+    r.sickUntil = Math.max(r.sickUntil, this.time + dur);
+    r.sickK = Math.min(r.sickK < 1 ? r.sickK : 1, k);
   }
 
-  private mutate(r: EcoRec) {
-    const cl = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
-    r.mut[0] = cl(r.mut[0] + (Math.random() - 0.5) * 0.014, -0.03, 0.03);
-    r.mut[1] = cl(r.mut[1] * (1 + (Math.random() - 0.5) * 0.16), 0.86, 1.18);
-    r.mut[2] = cl(r.mut[2] + Math.round((Math.random() - 0.5) * 2), -3, 3);
+  /** Мутация линии: дивергенция растёт тем быстрее, чем мутабельнее вид.
+   *  Когда она достигает единицы — популяция стала новым видом. Кулдаун
+   *  на всю планету: новый вид успевает расплодиться, а не тонет в череде
+   *  переименований. */
+  private evolve(r: EcoRec, feed: (k: FeedKind, x: number, y: number, t?: string) => void) {
+    const s = this.sp(r.sp);
+    r.div += (0.16 + 0.3 * s.traits.mutability) * (0.6 + Math.random() * 0.8);
     r.serial++;
-    if (r.mat >= 0) r.matSerial = r.serial; // мутация меняет только параметры шага
+    if (r.div >= 1) {
+      if (this.time < this.nextSpeciateAt) {
+        r.div = 0.92; // планета ещё не готова к новому виду — дивергенция зреет
+        return;
+      }
+      const child = this.newSpecies(s);
+      if (child) {
+        r.sp = child.id;
+        r.div = 0;
+        this.nextSpeciateAt = this.time + 45 + Math.random() * 45;
+        if (r.mat >= 0) r.matSerial = r.serial; // параметры шага меняются мягко, пересев не нужен
+        r.flashKind = 4;
+        r.flashUntil = this.time + 1.6;
+        feed('speciate', r.wx, r.wy, `новый вид: ${child.name.toLowerCase()}`);
+      } else {
+        r.div = 0.45; // таблица видов полна — эволюция продолжится позже
+      }
+    } else {
+      feed('mut', r.wx, r.wy);
+    }
+  }
+
+  /** Встреча видов на фронтире: симбионты дружат и рождают гибридов,
+   *  хищники охотятся и завоевывают блюдца. */
+  private conflict(a: EcoRec, b: EcoRec, hooks: EcoHooks, feed: (k: FeedKind, x: number, y: number, t?: string) => void) {
+    const sa = this.sp(a.sp);
+    const sb = this.sp(b.sp);
+
+    // симбиоз: два дружелюбных вида поддерживают друг друга
+    const sym = sa.traits.symbiosis + sb.traits.symbiosis;
+    if (Math.random() < 0.06 * sym) {
+      a.pop = Math.min(sa.spill * 1.2, a.pop + 2.5);
+      b.pop = Math.min(sb.spill * 1.2, b.pop + 2.5);
+      a.flashKind = 5;
+      a.flashUntil = this.time + 1.2;
+      b.flashKind = 5;
+      b.flashUntil = this.time + 1.2;
+      feed('symbiosis', a.wx, a.wy, `симбиоз: ${sa.name.toLowerCase()} + ${sb.name.toLowerCase()}`);
+      if (Math.random() < 0.06) this.hybridize(a, b, feed);
+      return;
+    }
+
+    // война: агрессор бьёт жертву — сила зависит от численности и брони
+    const att = sa.traits.aggression + Math.random() * 0.35 >= sb.traits.aggression + Math.random() * 0.35 ? a : b;
+    const def = att === a ? b : a;
+    const satt = att === a ? sa : sb;
+    const sdef = def === a ? sa : sb;
+    const power = satt.traits.aggression * Math.min(1.6, att.pop / 40);
+    const resist = 0.35 + 0.65 * sdef.traits.armor;
+    const dmg = (power * 11 * 0.5) / resist;
+    def.pop -= dmg;
+    att.pop = Math.min(satt.spill * 1.3, att.pop + dmg * 0.45); // хищник кормится
+    if (def.pop < Math.max(4, sdef.spill * 0.12)) {
+      this.conquer(att, def, hooks, feed);
+    } else {
+      def.flashKind = 2;
+      def.flashUntil = this.time + 1.0;
+      if (def.mat >= 0) this.sicken(def, 1.2, 0.88); // раны
+      feed('hunt', def.wx, def.wy, `${satt.name.toLowerCase()} охотится на ${sdef.name.toLowerCase()}`);
+    }
+  }
+
+  /** Завоевание: блюдце переходит победителю. Старая жизнь угасает под
+   *  новыми параметрами сама (честная Lenia), завоеватели входят через
+   *  стену, обращённую к родной колонии. */
+  private conquer(att: EcoRec, def: EcoRec, hooks: EcoHooks, feed: (k: FeedKind, x: number, y: number, t?: string) => void) {
+    const satt = this.sp(att.sp);
+    const oldName = this.sp(def.sp).name.toLowerCase();
+    def.sp = att.sp;
+    def.pop = 3;
+    def.div = 0;
+    def.lean = 0;
+    def.sickUntil = 0;
+    def.emitAt = this.time + 20 + Math.random() * 15;
+    def.serial++;
+    def.flashKind = 3;
+    def.flashUntil = this.time + 1.5;
+    if (def.mat >= 0) {
+      const dx = Math.sign(def.wx - att.wx);
+      const dy = Math.sign(def.wy - att.wy);
+      const d = dx !== 0 ? (dx > 0 ? 0 : 1) : dy > 0 ? 2 : 3;
+      for (let i = 0; i < 3; i++) hooks.placeImmigrant(def.mat, att.sp, OPP[d]);
+      def.matSerial = def.serial; // завоеватели уже на GPU — пересев не нужен
+    }
+    att.pop = Math.max(1, att.pop - 3);
+    feed('conquest', def.wx, def.wy, `${satt.name.toLowerCase()} завоевал блюдце ${oldName}`);
+  }
+
+  /** Гибрид: два вида-симбионта рождают нового — смесь черт родителей. */
+  private hybridize(a: EcoRec, b: EcoRec, feed: (k: FeedKind, x: number, y: number, t?: string) => void) {
+    const src = Math.random() < 0.5 ? a : b;
+    const d = Math.floor(Math.random() * 4);
+    const tx = src.wx + DX[d];
+    const ty = src.wy + DY[d];
+    if (!this.inWorld(tx, ty) || this.recs.has(this.key(tx, ty))) return;
+    const parentId = Math.random() < 0.5 ? a.sp : b.sp;
+    const child = this.newSpecies(this.sp(parentId));
+    if (!child) return;
+    const other = this.sp(child.parent === a.sp ? b.sp : a.sp);
+    child.traits.aggression = clamp((child.traits.aggression + other.traits.aggression) / 2 + (Math.random() - 0.5) * 0.1, 0.03, 0.97);
+    child.traits.armor = clamp((child.traits.armor + other.traits.armor) / 2 + (Math.random() - 0.5) * 0.1, 0.03, 0.97);
+    child.traits.mutability = clamp((child.traits.mutability + other.traits.mutability) / 2 + (Math.random() - 0.5) * 0.12, 0.03, 0.97);
+    child.traits.symbiosis = clamp((child.traits.symbiosis + other.traits.symbiosis) / 2 + (Math.random() - 0.5) * 0.1, 0.02, 0.97);
+    child.role = roleOf(child.traits);
+    this.recs.set(this.key(tx, ty), this.fresh(tx, ty, child.id, 3));
+    feed('hybrid', tx, ty, `гибрид: ${child.name.toLowerCase()}`);
   }
 
   /** Заполненное блюдце переливается в соседа: колонисты идут через
-   *  общую стену, несут свою эволюцию (мутации линии). */
-  private emigrate(r: EcoRec, hooks: EcoHooks, feed: (k: FeedKind, x: number, y: number) => void) {
+   *  общую стену. Пустое блюдце — колония, чужое — война. */
+  private emigrate(r: EcoRec, hooks: EcoHooks, feed: (k: FeedKind, x: number, y: number, t?: string) => void) {
     const d = Math.floor(Math.random() * 4);
     const tx = r.wx + DX[d];
     const ty = r.wy + DY[d];
@@ -360,59 +651,56 @@ export class Biosphere {
     const k = this.key(tx, ty);
     const t = this.recs.get(k);
     if (!t) {
-      // пустое блюдце — колония несёт свою эволюцию
-      const rec = this.fresh(tx, ty, r.sp, 3, [...r.mut]);
+      // пустое блюдце — колония несёт свой вид
+      const rec = this.fresh(tx, ty, r.sp, 2);
       rec.fromDir = OPP[d]; // пришли через стену, обращённую к родителю
       this.recs.set(k, rec);
-      r.pop = Math.max(0, r.pop - 2);
+      r.pop = Math.max(0.5, r.pop - 2);
       feed('spread', tx, ty);
     } else if (t.sp === r.sp) {
-      t.pop = Math.min(DISH_CAP + 20, t.pop + 3); // подкрепление своих
+      const s = this.sp(t.sp);
+      t.pop = Math.min(s.spill + 16, t.pop + 3); // подкрепление своих
       if (t.mat >= 0) hooks.placeImmigrant(t.mat, r.sp, OPP[d]);
-      r.pop = Math.max(0, r.pop - 2);
+      r.pop = Math.max(0.5, r.pop - 2);
     } else {
-      // чужой вид: война за блюдце — выживает сильнейший
-      t.pop -= 7;
-      if (t.pop < 3) {
-        t.sp = r.sp;
-        t.pop = 3;
-        t.mut = [...r.mut];
-        t.lean = 0;
-        t.emitAt = this.time + 25 + Math.random() * 20;
-        t.fromDir = OPP[d];
-        t.serial++;
-        t.flashKind = 1;
-        t.flashUntil = this.time + 1.3;
-        if (t.mat >= 0) {
-          hooks.perturb(t.mat, 0, Math.random() * 100); // старая колония подавлена
-          hooks.placeImmigrant(t.mat, r.sp, OPP[d]);
-          t.matSerial = t.serial; // вторжение без пересева — старая жизнь гаснет сама
-        }
-        feed('spread', tx, ty);
-      } else {
-        t.serial++;
-        if (t.mat >= 0) {
-          hooks.perturb(t.mat, 1, Math.random() * 100);
-          t.mass *= 0.55;
-          t.matSerial = t.serial;
-        }
-        t.flashKind = 2;
-        t.flashUntil = this.time + 1.3;
-        feed('virus', tx, ty);
-      }
-      r.pop = Math.max(0, r.pop - 4);
+      this.conflict(r, t, hooks, feed); // вторжение в чужое блюдце — война
     }
   }
 
-  private extinct(r: EcoRec, hooks: EcoHooks, feed: (k: FeedKind, x: number, y: number) => void) {
+  private extinct(r: EcoRec, hooks: EcoHooks, feed: (k: FeedKind, x: number, y: number, t?: string) => void) {
     const hadSlot = r.mat >= 0;
+    const name = this.sp(r.sp).name.toLowerCase();
     this.recs.delete(this.key(r.wx, r.wy));
     this.put0(r.wx, r.wy);
     if (hadSlot) {
       hooks.clearSlot(r.mat);
       r.mat = -1;
     }
-    if (Math.abs(r.wx - this.camX) <= 60 && Math.abs(r.wy - this.camY) <= 60) feed('extinct', r.wx, r.wy);
+    if (Math.abs(r.wx - this.camX) <= 60 && Math.abs(r.wy - this.camY) <= 60) {
+      feed('extinct', r.wx, r.wy, `колония погибла: ${name}`);
+    }
+  }
+
+  private fresh(wx: number, wy: number, sp: number, pop: number): EcoRec {
+    return {
+      wx,
+      wy,
+      sp,
+      pop,
+      mass: clamp(pop / POP_PER_MASS, 0, 1),
+      div: 0,
+      mat: -1,
+      serial: 1,
+      matSerial: 0,
+      matSteps: 0,
+      lean: 0,
+      emitAt: this.time + 20 + Math.random() * 15,
+      fromDir: -1,
+      sickUntil: 0,
+      sickK: 1,
+      flashKind: 1,
+      flashUntil: this.time + 1.3,
+    };
   }
 
   /* ---------- мета-текстура планеты ---------- */
@@ -445,18 +733,22 @@ export class Biosphere {
     return this.meta;
   }
 
+  /** Ячейка блюдца: R = слот(ст.4б) + вид(мл.4б), G = жизнь(6б) + вид(ст.2б),
+   *  B = слот(мл.8б), A = вспышка(тип 3б + амплитуда 5б). */
   private cell(r: EcoRec) {
-    const life = r.mat >= 0 ? Math.min(1, r.mass * 2) : Math.sqrt(Math.min(1, r.pop / DISH_CAP));
+    const life = r.mat >= 0 ? Math.min(1, r.mass * 2) : Math.sqrt(Math.min(1, r.pop / this.sp(r.sp).spill));
     let kind = 0;
     let amp = 0;
     if (r.flashKind > 0 && r.flashUntil > this.time) {
       kind = r.flashKind;
       amp = Math.min(1, (r.flashUntil - this.time) / 1.3);
     }
-    const g = Math.round(Math.min(1, life * (1 + 0.9 * amp)) * 255);
+    const life6 = Math.round(Math.min(1, life * (1 + 0.9 * amp)) * 63);
+    const spEnc = r.sp + 1; // 1..62, 0 — мёртвое блюдце
     const slotEnc = r.mat >= 0 ? r.mat + 1 : 0;
-    const rb = ((slotEnc >> 8) << 4) | (r.sp + 1);
-    const a = kind > 0 ? (kind << 6) | Math.round(63 * amp) : 0;
+    const rb = ((slotEnc >> 8) << 4) | (spEnc & 15);
+    const g = (life6 << 2) | (spEnc >> 4);
+    const a = kind > 0 ? (kind << 5) | Math.round(31 * amp) : 0;
     this.put(r.wx, r.wy, rb, g, slotEnc & 255, a);
   }
 

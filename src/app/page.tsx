@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Plus, Minus, Maximize, Sprout, Trash2, Download } from 'lucide-react';
 import { POND_LIST, type Creature } from '@/lib/lenia/creatures';
-import { PondEngine, speciesPalette, paletteColor, DISH, WORLD, LOD_LO, LOD_HI, type PondStats } from '@/lib/lenia/engine';
-import { Biosphere, dishParams, DISH_CAP, POP_PER_MASS, type EcoRec, type FeedKind } from '@/lib/lenia/eco';
+import { PondEngine, speciesColorJS, DISH, WORLD, LOD_LO, LOD_HI, type PondStats } from '@/lib/lenia/engine';
+import { Biosphere, POP_PER_MASS, type EcoRec, type FeedKind } from '@/lib/lenia/eco';
 import { BlobTracker, type EventKind } from '@/lib/lenia/tracker';
 
 const SPEED_MIN = 0.25;
@@ -34,6 +34,11 @@ const FEED_COLORS: Record<FeedItemKind, string> = {
   spread: 'text-emerald-300/90',
   origin: 'text-lime-200/90',
   extinct: 'text-rose-300/80',
+  speciate: 'text-cyan-300/90',
+  hybrid: 'text-fuchsia-300/90',
+  conquest: 'text-red-300/90',
+  symbiosis: 'text-teal-200/90',
+  hunt: 'text-orange-400/90',
   info: 'text-neutral-400/80',
 };
 const FEED_WORDS: Record<FeedItemKind, string> = {
@@ -41,11 +46,16 @@ const FEED_WORDS: Record<FeedItemKind, string> = {
   split: 'деление!',
   death: 'гибель',
   merge: 'слияние',
-  virus: 'вирус!',
+  virus: 'болезнь!',
   mut: 'мутация',
   spread: 'расселение',
   origin: 'зарождение жизни',
   extinct: 'вымирание',
+  speciate: 'новый вид!',
+  hybrid: 'гибрид!',
+  conquest: 'завоевание',
+  symbiosis: 'симбиоз',
+  hunt: 'охота',
   info: '',
 };
 
@@ -79,16 +89,18 @@ export interface HudSnap {
   pop: number;
   fps: number;
   spName: string;
+  spRole: string;
   real: boolean;
   planet: number;
+  species: number;
   events: { id: number; kind: FeedItemKind; t: number; text: string }[];
 }
 
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
 
-/** Сколько организмов посадить при материализации блюдца:
- *  минимум 4 — у колонии должен быть шанс основаться. */
-const cnt = (r: EcoRec) => clamp(Math.round(r.pop * 0.22), 4, 48);
+/** Сколько организмов посадить при материализации блюдца: небольшая
+ *  колония, которая честно разрастается сама — без «ста организмов сразу». */
+const cnt = (r: EcoRec) => clamp(Math.round(r.pop * 0.25), 3, 16);
 
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -336,16 +348,16 @@ export default function Page() {
     };
 
     const hooks = {
-      perturb: (slot: number, mode: number, seed: number) => engine.perturb(slot, mode, seed),
+      perturb: (slot: number, mode: number, seed: number, k?: number) => engine.perturb(slot, mode, seed, k ?? 1),
       clearSlot: (slot: number) => {
         releaseAndFree(slot);
         flushMeta();
       },
       placeImmigrant: (slot: number, sp: number, fromDir: number) => {
         const [lx, ly] = wallPos(fromDir);
-        engine.placeAdd(slot, sp, Math.floor(Math.random() * 4), lx, ly);
+        engine.placeAdd(slot, world.speciesBase(sp), Math.floor(Math.random() * 4), lx, ly);
       },
-      feed: (kind: FeedKind, _wx: number, _wy: number) => pushFeed(kind, world.time, FEED_WORDS[kind]),
+      feed: (kind: FeedKind, _wx: number, _wy: number, text?: string) => pushFeed(kind, world.time, text || FEED_WORDS[kind]),
     };
 
     /* ---- старт: обзор всей планеты, жизнь зародится сама ---- */
@@ -374,19 +386,32 @@ export default function Page() {
         pushFeed('info', 0, 'на паузе — возобнови эволюцию, чтобы заселять');
         return;
       }
+      // зарождение жизни: ОДНО блюдце, ОДИН вид — маленькая колония
+      // выбранных существ рядом с центром обзора
       const cam = camRef.current;
-      let n = 0;
-      for (let attempt = 0; attempt < 500 && n < 40; attempt++) {
-        const wx = Math.round(cam.x + (Math.random() - 0.5) * 26);
-        const wy = Math.round(cam.y + (Math.random() - 0.5) * 26);
-        if (!world.inWorld(wx, wy) || world.peek(wx, wy)) continue;
-        seedSafe(wx, wy, Math.floor(Math.random() * SPECIES.length), 4 + Math.random() * 7);
-        n++;
+      const sp = selRef.current;
+      const cx = Math.round(cam.x);
+      const cy = Math.round(cam.y);
+      let best: { x: number; y: number; d: number } | null = null;
+      for (let rad = 0; rad <= 12 && !best; rad++) {
+        for (let dy = -rad; dy <= rad && !best; dy++) {
+          for (let dx = -rad; dx <= rad; dx++) {
+            if (Math.max(Math.abs(dx), Math.abs(dy)) !== rad) continue;
+            const wx = cx + dx;
+            const wy = cy + dy;
+            if (!world.inWorld(wx, wy) || world.peek(wx, wy)) continue;
+            const d = dx * dx + dy * dy;
+            if (!best || d < best.d) best = { x: wx, y: wy, d };
+          }
+        }
       }
-      if (n > 0) {
-        guardRef.current = performance.now();
-        pushFeed('info', 0, `жизнь засеяна: ${n} блюдцев рядом`);
+      if (!best) {
+        pushFeed('info', 0, 'рядом нет свободного блюдца — отдались или очисти место');
+        return;
       }
+      seedSafe(best.x, best.y, sp, 4);
+      guardRef.current = performance.now();
+      pushFeed('origin', world.time, `жизнь зародилась: ${SPECIES[sp].ru.toLowerCase()}`);
     };
 
     // «Очистить» стирает ВСЮ планету: каждое блюдце, вся жизнь
@@ -433,9 +458,10 @@ export default function Page() {
           pushFeed('info', 0, 'на паузе — возобнови эволюцию, чтобы заселять');
           return;
         }
-        const sp = selRef.current;
+        const sp = selRef.current; // исконный вид из ленты — тело существа
         const had = world.peek(dx, dy);
-        if (!had || had.sp !== sp) world.seedDish(dx, dy, sp, had && had.sp >= 0 ? Math.max(3, had.pop) : 1);
+        if (!had) world.seedDish(dx, dy, sp, 1);
+        else if (world.speciesBase(had.sp) !== sp) world.seedDish(dx, dy, sp, Math.max(3, had.pop)); // другой род — новый вид в блюдце
         const r = world.peek(dx, dy);
         if (!r) return;
         let slot = r.mat;
@@ -687,7 +713,7 @@ export default function Page() {
       const real = !!r && r.mat >= 0;
       if (real) {
         st = engine.stats(r!.mat);
-        t = r!.matSteps * (1 / SPECIES[r!.sp].T);
+        t = r!.matSteps * (1 / world.speciesT(r!.sp));
         const stepsSince = Math.max(1, Math.round(speedRef.current * ((now - lastStats) / 16.7)));
         events = trackerRef.current.update(st.blobs, t, stepsSince);
       } else {
@@ -708,9 +734,11 @@ export default function Page() {
           t,
           pop: real ? st.pop : r ? Math.round(r.pop) : 0,
           fps: Math.round(fpsRef.current),
-          spName: r && r.sp >= 0 ? SPECIES[r.sp].ru : 'пусто',
+          spName: r && r.sp >= 0 ? world.speciesName(r.sp) : 'пусто',
+          spRole: r && r.sp >= 0 ? world.speciesRole(r.sp) : '',
           real,
           planet: world.aliveCount(),
+          species: world.aliveSpeciesCount(),
           events: [...feedRef.current],
         });
       }
@@ -783,7 +811,7 @@ export default function Page() {
           r.matSerial = r.serial;
           r.matSteps = 0;
           r.mass = Math.max(0.004, r.pop / POP_PER_MASS);
-          engine.seedSlot(slot, r.sp, cnt(r), r.fromDir);
+          engine.seedSlot(slot, world.speciesBase(r.sp), cnt(r), r.fromDir);
           world.touch(r);
           ops++;
         }
@@ -853,7 +881,7 @@ export default function Page() {
             const dy = r.wy - cam.y;
             if (dx * dx + dy * dy > 9) continue; // только ближний круг
             for (let k2 = 0; k2 < share && done < nearCap; k2++) {
-              engine.stepSlot(r.mat, dishParams(r));
+              engine.stepSlot(r.mat, world.dishParams(r));
               r.matSteps++;
               done++;
             }
@@ -862,7 +890,7 @@ export default function Page() {
           if (rest < 0) rest = 0;
           while (rest > 0) {
             const r = aliveList[cursor++ % aliveList.length];
-            engine.stepSlot(r.mat, dishParams(r));
+            engine.stepSlot(r.mat, world.dishParams(r));
             r.matSteps++;
             rest--;
           }
@@ -924,11 +952,16 @@ export default function Page() {
       eco: (wx: number, wy: number) => {
         const r = world.peek(wx, wy);
         return r
-          ? { sp: r.sp, spName: SPECIES[r.sp].ru, pop: r.pop, mass: r.mass, mat: r.mat, serial: r.serial, mut: [...r.mut], emitAt: r.emitAt, time: world.time }
+          ? { sp: r.sp, spName: world.speciesName(r.sp), pop: r.pop, mass: r.mass, div: r.div, mat: r.mat, serial: r.serial, emitAt: r.emitAt, time: world.time }
           : null;
       },
       aliveCount: () => world.aliveCount(),
       aliveNear: (rad: number) => world.aliveNear(rad),
+      speciesCount: () => world.aliveSpeciesCount(),
+      species: () =>
+        world.species
+          .filter((s): s is NonNullable<typeof s> => !!s)
+          .map((s) => ({ id: s.id, name: s.name, role: s.role, base: s.base, gen: s.gen, parent: s.parent, alive: s.alive, m: +s.m.toFixed(3), s: +s.s.toFixed(4), T: s.T })),
       tick: (n = 1) => {
         for (let i = 0; i < n; i++) world.tick(0.5, hooks);
         world.buildMeta();
@@ -937,7 +970,7 @@ export default function Page() {
       stepDish: (wx: number, wy: number, n: number) => {
         const r = world.peek(wx, wy);
         if (r && r.mat >= 0) {
-          for (let i = 0; i < n; i++) engine.stepSlot(r.mat, dishParams(r));
+          for (let i = 0; i < n; i++) engine.stepSlot(r.mat, world.dishParams(r));
           r.matSteps += n;
         }
       },
@@ -960,8 +993,8 @@ export default function Page() {
         const fd = focusDish();
         const r = world.peek(fd.x, fd.y);
         return r
-          ? { dish: fd, sp: r.sp, spName: SPECIES[r.sp].ru, pop: r.pop, mass: r.mass, mat: r.mat, serial: r.serial, mut: [...r.mut], time: world.time, steps: r.matSteps }
-          : { dish: fd, sp: -1, spName: '-', pop: 0, mass: 0, mat: -1, serial: 0, mut: [0, 1, 0], time: world.time, steps: 0 };
+          ? { dish: fd, sp: r.sp, spName: world.speciesName(r.sp), pop: r.pop, mass: r.mass, mat: r.mat, serial: r.serial, div: r.div, time: world.time, steps: r.matSteps }
+          : { dish: fd, sp: -1, spName: '-', pop: 0, mass: 0, mat: -1, serial: 0, div: 0, time: world.time, steps: 0 };
       },
       budget: (v?: number) => {
         if (v !== undefined) budgetRef.current = v;
@@ -978,10 +1011,10 @@ export default function Page() {
         stepAcc: +stepAcc.toFixed(2),
       }),
       fps: () => fpsRef.current,
-      speciesCount: SPECIES.length,
       place: (wx: number, wy: number, sp: number) => {
         const had = world.peek(wx, wy);
         if (!had) world.seedDish(wx, wy, sp, 1);
+        else if (world.speciesBase(had.sp) !== sp) world.seedDish(wx, wy, sp, Math.max(3, had.pop));
         const r = world.peek(wx, wy);
         if (!r) return;
         let slot = r.mat;
@@ -1070,8 +1103,9 @@ export default function Page() {
             <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-emerald-400/80">клеточный автомат · Lenia</p>
             <h1 className="mt-1.5 text-3xl font-extrabold tracking-tight text-neutral-50">Пруд Лении</h1>
             <p className="mt-2 text-sm leading-relaxed text-neutral-400">
-              Планета из 2000×2000 блюдцев. Жизнь зарождается в разных уголках, в разное время и разных видов. Организмы чувствуют стены своего блюдца и
-              заполняют его — все 200 существ — и лишь потом колония переливается в соседние, мутирует и борется за территорию.
+              Планета из 2000×2000 блюдцев. Жизнь зарождается один раз — один вид в одном блюдце. Дальше всё делает эволюция: колонии мутируют и
+              рождают новые виды, хищники охотятся и завоевывают чужие блюдца, симбионты дают гибридов, болезни гасят колонии постепенно, а не стирают
+              в миг.
             </p>
             <button
               onClick={startEvolution}
@@ -1106,7 +1140,7 @@ export default function Page() {
           {fmtSpeed(speed)}
         </button>
 
-        <RailBtn onClick={() => actionsRef.current.populate()} testid="populate" label="Заселить блюдца рядом">
+        <RailBtn onClick={() => actionsRef.current.populate()} testid="populate" label="Зарождение жизни выбранным видом">
           <Sprout className="h-5 w-5" />
         </RailBtn>
 
@@ -1264,7 +1298,7 @@ function SpeedPanel({ value, onChange, onClose }: { value: number; onChange: (v:
 /* ---------- HUD: наблюдение за блюдцем под центром ---------- */
 
 function Hud({ callbackRef }: { callbackRef: { current: (s: HudSnap) => void } }) {
-  const [snap, setSnap] = useState<HudSnap>({ t: 0, pop: 0, fps: 0, spName: '', real: false, planet: 0, events: [] });
+  const [snap, setSnap] = useState<HudSnap>({ t: 0, pop: 0, fps: 0, spName: '', spRole: '', real: false, planet: 0, species: 0, events: [] });
 
   useEffect(() => {
     callbackRef.current = setSnap;
@@ -1283,8 +1317,9 @@ function Hud({ callbackRef }: { callbackRef: { current: (s: HudSnap) => void } }
           <p className="text-[9px] uppercase tracking-wider text-emerald-500/80">{plural(Math.abs(snap.pop))}</p>
         </div>
         <p className="mt-0.5 truncate text-[11px] text-neutral-400">{snap.spName}</p>
+        {snap.spRole && <p className="truncate text-[9px] uppercase tracking-wider text-cyan-400/70">{snap.spRole}</p>}
         <p className="font-mono text-[9px] tabular-nums text-neutral-600">
-          {snap.real ? `шаг ${snap.t.toFixed(0)}` : `эпоха ${snap.t}`} · {snap.fps} fps · планета {snap.planet}
+          {snap.real ? `шаг ${snap.t.toFixed(0)}` : `эпоха ${snap.t}`} · {snap.fps} fps · блюдц {snap.planet} · видов {snap.species}
         </p>
       </div>
       <div className="max-w-full" data-testid="feed">
@@ -1312,7 +1347,6 @@ function SpeciesChip({ sp, palId, selected, onSelect }: { sp: Creature; palId: n
     cv.width = S;
     cv.height = S;
     ctx.clearRect(0, 0, S, S);
-    const stops = speciesPalette(palId).stops;
     const scale = Math.min((S - 6) / sp.w, (S - 6) / sp.h);
     const ox = (S - sp.w * scale) / 2;
     const oy = (S - sp.h * scale) / 2;
@@ -1320,7 +1354,7 @@ function SpeciesChip({ sp, palId, selected, onSelect }: { sp: Creature; palId: n
       for (let x = 0; x < sp.w; x++) {
         const v = sp.cells[y * sp.w + x];
         if (v <= 0.03) continue;
-        const [r, g2, b] = paletteColor(stops, v);
+        const [r, g2, b] = speciesColorJS(palId, v);
         ctx.fillStyle = `rgb(${Math.round(r * 255)},${Math.round(g2 * 255)},${Math.round(b * 255)})`;
         ctx.fillRect(ox + x * scale, oy + y * scale, Math.max(1, scale), Math.max(1, scale));
       }

@@ -30,31 +30,8 @@ export const LOD_CELL = DISH / LOD_N; // клеток, усредняемых в
 export const LOD_LO = 32; // px на блюдце: ниже — чистый LOD-рендер
 export const LOD_HI = 64; // px на блюдце: выше — честная выборка клеток
 
-export interface Palette {
-  id: string;
-  name: string;
-  stops: [number, number, number][];
-}
-
-const hex = (h: string): [number, number, number] => [
-  parseInt(h.slice(1, 3), 16) / 255,
-  parseInt(h.slice(3, 5), 16) / 255,
-  parseInt(h.slice(5, 7), 16) / 255,
-];
-
-export const PALETTES: Palette[] = [
-  { id: 'bio', name: 'Биолюминесценция', stops: ['#02120c', '#06392c', '#0e8f60', '#54e8a3', '#d2ffe4', '#f6fff9'].map(hex) },
-  { id: 'solar', name: 'Солнечная', stops: ['#0d0801', '#3d2502', '#7a4a03', '#b8770a', '#e8b930', '#fff3c4'].map(hex) },
-  { id: 'viridis', name: 'Виридис', stops: ['#12261e', '#1e4a3a', '#2a788e', '#22a884', '#7ad151', '#fde725'].map(hex) },
-  { id: 'magma', name: 'Магма', stops: ['#0f030a', '#3b0f70', '#8c2981', '#de4968', '#fe9f6d', '#fcfdbf'].map(hex) },
-] as unknown as Palette[];
-
-/** Палитра вида по индексу в POND_LIST. */
-const SPECIES_PALETTE = ['bio', 'magma', 'viridis', 'solar', 'viridis', 'bio', 'magma', 'solar', 'viridis', 'magma', 'solar'];
-
-export function speciesPalette(i: number): Palette {
-  return PALETTES.find((p) => p.id === SPECIES_PALETTE[i]) ?? PALETTES[0];
-}
+/** Палитры не нужны: цвет вида считается в шейдере из его id (hue),
+ *  поэтому новых видов может быть много — до 62, и все различимы. */
 
 /* ---------- ядро и рост (JS-зеркало для нормировки) ---------- */
 
@@ -91,15 +68,26 @@ function kernelNorm(R: number, b: number[], kn: number): number {
   return sum || 1;
 }
 
-const smooth = (t: number) => t * t * (3 - 2 * t);
-
-/** JS-зеркало палитры шейдера (миниатюры видов). */
-export function paletteColor(stops: [number, number, number][], t: number): [number, number, number] {
-  const x = Math.min(1, Math.max(0, t)) * 5;
-  const i = Math.min(Math.floor(x), 4);
-  const k = smooth(x - i);
-  const mix = (a: number, b2: number) => a + (b2 - a) * k;
-  return [mix(stops[i][0], stops[i + 1][0]), mix(stops[i][1], stops[i + 1][1]), mix(stops[i][2], stops[i + 1][2])];
+/** Цвет вида — зеркало шейдера: hue из золотого сечения по id вида,
+ *  t — яркость 0..1 (тело темнее воды → яркий цвет вида). */
+export function speciesColorJS(sp: number, t: number): [number, number, number] {
+  const x = Math.min(1, Math.max(0, t));
+  const h = (0.61803399 * sp + 0.06) % 1;
+  const s = 0.62 + 0.3 * x;
+  const v = 0.05 + 0.95 * x;
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const w = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: return [v, w, p];
+    case 1: return [q, v, p];
+    case 2: return [p, v, w];
+    case 3: return [p, q, v];
+    case 4: return [w, p, v];
+    default: return [v, p, q];
+  }
 }
 
 /* ---------- шейдеры ---------- */
@@ -146,7 +134,8 @@ void main() {
   frag = vec4(clamp(a + uDt * growth(u), 0.0, 1.0), 0.0, 0.0, 1.0);
 }`;
 
-/** Возмущения экосистемы: мор (0) и вирус (1). Маски проверены NumPy. */
+/** Возмущения экосистемы: мор (0), вирус (1) и угасание (2 — умножение
+ *  на uK: болезни гасят колонию постепенно, тик за тиком). */
 const PERTURB_FRAG = `#version 300 es
 precision highp float;
 precision highp int;
@@ -154,6 +143,7 @@ uniform sampler2D uState;
 uniform ivec2 uOrigin;
 uniform int uMode;
 uniform float uSeed;
+uniform float uK;
 out vec4 frag;
 float h(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7)) + uSeed) * 43758.5453); }
 float vnoise(vec2 p) {
@@ -169,10 +159,12 @@ void main() {
   if (uMode == 0) {
     float n = vnoise(lc * 0.10);
     frag = vec4(a * clamp((n - 0.30) / 0.36, 0.18, 1.0), 0.0, 0.0, 1.0);
-  } else {
+  } else if (uMode == 1) {
     float n = vnoise(lc * 0.13);
     float blob = smoothstep(0.55, 0.85, vnoise(lc * 0.09 + vec2(37.0)));
     frag = vec4(clamp(a * clamp((n - 0.30) / 0.42, 0.18, 1.0) + 0.5 * blob, 0.0, 1.0), 0.0, 0.0, 1.0);
+  } else {
+    frag = vec4(a * uK, 0.0, 0.0, 1.0);
   }
 }`;
 
@@ -225,8 +217,11 @@ void main() {
  *  - средне (1..32 px): тексель блюдца — цвет вида × уровень жизни,
  *    с тихим ползущим шумом; материализованные блюдца — LOD-структура;
  *  - близко (≥32 px): честные клетки из слота, у стен — пустота.
- * Упаковка мета-тексселя: R = (slotEnc>>8)<<4 | (sp+1), G = жизнь,
- * B = slotEnc&255, A = вспышка (kind<<6 | амплитуда).
+ * Упаковка мета-тексселя: R = слот(ст.4б) + вид(мл.4б),
+ * G = жизнь(6б) + вид(ст.2б) — виды id 0..61, B = слот(мл.8б),
+ * A = вспышка (тип 3б + амплитуда 5б).
+ * Цвет вида — hue из золотого сечения: каждый вид (в том числе
+ * рождённый эволюцией) имеет свой узнаваемый цвет.
  */
 const RENDER_FRAG = `#version 300 es
 precision highp float;
@@ -234,7 +229,6 @@ precision highp int;
 uniform sampler2D uState;
 uniform sampler2D uLod;
 uniform sampler2D uMeta;
-uniform vec3 uPal[66];
 uniform vec2 uCam;
 uniform float uScale;
 uniform vec2 uRes;
@@ -259,13 +253,15 @@ float vnoise(vec2 p) {
   float a = h21(i), b = h21(i + vec2(1.0, 0.0)), c = h21(i + vec2(0.0, 1.0)), d = h21(i + vec2(1.0, 1.0));
   return a + (b - a) * f.x + (c - a) * f.y + (a - b - c + d) * f.x * f.y;
 }
-vec3 palette(int sp, float t) {
-  float x = clamp(t, 0.0, 1.0) * 5.0;
-  int i = int(min(floor(x), 4.0));
-  float f = x - float(i);
-  f = f * f * (3.0 - 2.0 * f);
-  int base = sp * 6;
-  return mix(uPal[base + i], uPal[base + i + 1], f);
+vec3 hsv2rgb(vec3 c) {
+  vec3 p = abs(fract(c.xxx + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+  return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+}
+// цвет вида: hue из золотого сечения по id — до 62 различимых видов
+vec3 speciesColor(int sp, float t) {
+  float x = clamp(t, 0.0, 1.0);
+  float hue = fract(0.61803399 * float(sp) + 0.06);
+  return hsv2rgb(vec3(hue, 0.62 + 0.30 * x, 0.05 + 0.95 * x));
 }
 // честная выборка клеток слота; за стеной блюдца — пустота
 float field(ivec2 origin, vec2 f) {
@@ -339,13 +335,15 @@ void main() {
 
   vec4 m = uScale >= 0.95 ? texelFetch(uMeta, ivec2(dishf), 0) : metaAt(w);
   int rb = int(m.r * 255.0 + 0.5);
-  int sp = (rb & 15) - 1;
+  int gb = int(m.g * 255.0 + 0.5);
+  int spEnc = ((gb & 3) << 4) + (rb & 15);
+  int sp = spEnc - 1;
   int slotEnc = ((rb >> 4) << 8) + int(m.b * 255.0 + 0.5);
   int slot = slotEnc > 0 ? slotEnc - 1 : -1;
-  float life = m.g;
+  float life = float(gb >> 2) / 63.0;
   int fa = int(m.a * 255.0 + 0.5);
-  int fkind = fa >> 6;
-  float flash = float(fa & 63) / 63.0;
+  int fkind = fa >> 5;
+  float flash = float(fa & 31) / 31.0;
 
   // вода блюдца: вблизи — своя у каждого, вдали — глубокая гладь
   vec3 water = mix(vec3(0.014, 0.040, 0.044), vec3(0.043, 0.031, 0.013), h1) * (0.72 + 0.56 * h1);
@@ -367,10 +365,10 @@ void main() {
     }
     float sh = v * v * (3.0 - 2.0 * v);
     float vis = smoothstep(0.015, 0.11, v);
-    col = mix(water, palette(sp, pow(sh, uGamma)), vis);
+    col = mix(water, speciesColor(sp, pow(sh, uGamma)), vis);
   } else if (sp >= 0) {
     // статистическое блюдце: цвет вида × уровень жизни, тихий ползущий шум
-    vec3 sc = palette(sp, 0.80);
+    vec3 sc = speciesColor(sp, 0.80);
     float n = vnoise(f * 3.0 + vec2(h1 * 17.0) + vec2(uTime * 0.05));
     n = mix(0.5, n, smoothstep(1.5, 4.0, uScale));
     float vis = smoothstep(0.02, 0.30, life) * (0.72 + 0.38 * n);
@@ -380,8 +378,10 @@ void main() {
   }
 
   // вспышки событий: кольцо вблизи, пульс всего блюдца вдали
+  // 1 рождение (зелёный), 2 болезнь (янтарный), 3 гибель (красный),
+  // 4 новый вид (фиолетовый), 5 симбиоз (циановый)
   if (flash > 0.003 && fkind > 0) {
-    vec3 fc = fkind == 1 ? vec3(0.20, 0.90, 0.55) : fkind == 2 ? vec3(0.95, 0.75, 0.20) : vec3(0.95, 0.35, 0.45);
+    vec3 fc = fkind == 1 ? vec3(0.20, 0.90, 0.55) : fkind == 2 ? vec3(0.95, 0.75, 0.20) : fkind == 3 ? vec3(0.95, 0.35, 0.45) : fkind == 4 ? vec3(0.80, 0.60, 1.00) : vec3(0.45, 0.90, 0.95);
     if (uScale > 14.0) {
       vec2 dpx = min(f, vec2(1.0) - f) * uScale;
       float edge = min(dpx.x, dpx.y);
@@ -476,7 +476,6 @@ export class PondEngine {
   private stampTex!: WebGLTexture;
   private stampBuf = new Float32Array(DISH * DISH);
   private norms: number[];
-  private palUniform: Float32Array;
   private zeroTile = new Float32Array(DISH * DISH);
   private uniCache = new Map<WebGLProgram, Map<string, WebGLUniformLocation | null>>();
   private pixelBuf = new Float32Array(DISH * DISH);
@@ -509,11 +508,6 @@ export class PondEngine {
 
     this.speciesList = POND_LIST;
     this.norms = this.speciesList.map((c) => kernelNorm(c.R, c.b, c.kn));
-    this.palUniform = new Float32Array(this.speciesList.length * 6 * 3);
-    this.speciesList.forEach((c, i) => {
-      const pal = speciesPalette(i);
-      pal.stops.forEach((s, j) => this.palUniform.set(s, (i * 6 + j) * 3));
-    });
 
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -807,8 +801,8 @@ export class PondEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  /** Возмущение слота: 0 — мор, 1 — вирус. */
-  perturb(slot: number, mode: number, seed: number) {
+  /** Возмущение слота: 0 — мор, 1 — вирус, 2 — угасание (умножение на k). */
+  perturb(slot: number, mode: number, seed: number, k = 1) {
     const gl = this.gl;
     const [ox, oy] = this.slotOrigin(slot);
     gl.useProgram(this.progPerturb);
@@ -818,6 +812,7 @@ export class PondEngine {
     gl.uniform2i(this.uni(this.progPerturb, 'uOrigin'), ox, oy);
     gl.uniform1i(this.uni(this.progPerturb, 'uMode'), mode);
     gl.uniform1f(this.uni(this.progPerturb, 'uSeed'), seed);
+    gl.uniform1f(this.uni(this.progPerturb, 'uK'), k);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[1]);
     gl.viewport(ox, oy, DISH, DISH);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -1001,8 +996,6 @@ export class PondEngine {
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, this.metaTex);
     gl.uniform1i(this.uni(p, 'uMeta'), 2);
-    const nu = Math.min(this.speciesList.length, 11);
-    gl.uniform3fv(this.uni(p, 'uPal'), this.palUniform.subarray(0, nu * 6 * 3));
     gl.uniform2f(this.uni(p, 'uCam'), cam.x, cam.y);
     gl.uniform1f(this.uni(p, 'uScale'), cam.scale * dpr);
     gl.uniform2f(this.uni(p, 'uRes'), canvas.width, canvas.height);
