@@ -2,28 +2,46 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Plus, Minus, Maximize, Sprout, Trash2, Thermometer, Download } from 'lucide-react';
-import { CREATURES, POND_SPECIES, type Creature } from '@/lib/lenia/creatures';
-import { PondEngine, speciesPalette, paletteColor, DISH, type PondRect } from '@/lib/lenia/engine';
+import { POND_LIST, type Creature } from '@/lib/lenia/creatures';
+import { PondEngine, speciesPalette, paletteColor, DISH, META, TEX_PX, type PondStats } from '@/lib/lenia/engine';
+import { Biosphere, dishParams, type EcoRec, type FeedKind } from '@/lib/lenia/eco';
 import { BlobTracker, type EventKind } from '@/lib/lenia/tracker';
 
-const SPEEDS = [1, 2, 4, 8];
+const SPEEDS = [0.5, 1, 2, 4, 8];
 const PLACE_PX = 220; // блюдце крупнее этого — тап сажает существо, меньше — перелёт
 const STATS_MS = 500;
+const ECO_MS = 500;
 const GLOW_MS = 1500;
+const MAT_OPS = 3; // материализаций за кадр (плавно, без фризов)
+const MIN_SCALE = 3; // пикселей на блюдце в дальнем обзоре (полей видно тысячи)
 
-const SPECIES: Creature[] = POND_SPECIES.map((id) => CREATURES.find((c) => c.id === id)!).filter(Boolean);
+const SPECIES: Creature[] = POND_LIST;
 
-const GLOW_COLORS: Record<EventKind, string> = {
-  birth: '#34d399',
-  split: '#a3e635',
-  merge: '#fbbf24',
-  death: '#fb7185',
+type FeedItemKind = EventKind | FeedKind | 'info';
+
+const FEED_COLORS: Record<FeedItemKind, string> = {
+  birth: 'text-emerald-300/90',
+  split: 'text-lime-300/90',
+  merge: 'text-amber-300/90',
+  death: 'text-rose-300/80',
+  virus: 'text-orange-300/90',
+  mut: 'text-amber-200/90',
+  spread: 'text-emerald-300/90',
+  origin: 'text-lime-200/90',
+  extinct: 'text-rose-300/80',
+  info: 'text-neutral-400/80',
 };
-const EVENT_WORDS: Record<EventKind, string> = {
+const FEED_WORDS: Record<FeedItemKind, string> = {
   birth: 'рождение',
   split: 'деление!',
   death: 'гибель',
   merge: 'слияние',
+  virus: 'вирус!',
+  mut: 'мутация',
+  spread: 'расселение',
+  origin: 'зарождение жизни',
+  extinct: 'вымирание',
+  info: '',
 };
 
 const plural = (n: number) => {
@@ -43,6 +61,14 @@ interface Glow {
   born: number;
 }
 
+interface VisRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  count: number;
+}
+
 export interface HudSnap {
   t: number;
   pop: number;
@@ -50,7 +76,9 @@ export interface HudSnap {
   spName: string;
   climate: number;
   placeable: boolean;
-  events: { id: number; kind: EventKind | 'info'; t: number; text: string }[];
+  real: boolean;
+  planet: number;
+  events: { id: number; kind: FeedItemKind; t: number; text: string }[];
 }
 
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
@@ -59,25 +87,26 @@ export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<PondEngine | null>(null);
-  const camRef = useRef({ x: 0, y: 0, scale: 600 });
+  const worldRef = useRef<Biosphere | null>(null);
+  const camRef = useRef({ x: 0.5, y: 0.5, scale: 400 });
   const animRef = useRef<{ t0: number; dur: number; from: { x: number; y: number; scale: number }; to: { x: number; y: number; scale: number } } | null>(null);
   const sizeRef = useRef({ w: 0, h: 0, dpr: 1 });
-  const budgetRef = useRef(12);
+  const budgetRef = useRef(24); // шагов за кадр (дробный — медленным устройствам и часть кадра)
   const fpsRef = useRef(0);
   const emaRef = useRef(16.7);
   const runningRef = useRef(true);
-  const speedRef = useRef(2);
+  const speedRef = useRef(1);
   const selRef = useRef(0);
-  const focusRef = useRef(0);
-  const visRef = useRef<PondRect | null>(null);
+  const visRef = useRef<VisRect | null>(null);
   const guardRef = useRef(0);
   const glowsRef = useRef<Glow[]>([]);
-  const feedRef = useRef<{ id: number; kind: EventKind | 'info'; t: number; text: string }[]>([]);
+  const feedRef = useRef<{ id: number; kind: FeedItemKind; t: number; text: string }[]>([]);
   const feedIdRef = useRef(1);
   const hudCbRef = useRef<(s: HudSnap) => void>(() => {});
   const trackerRef = useRef(new BlobTracker(DISH));
   const installEvtRef = useRef<Event | null>(null);
   const lastTapRef = useRef({ t: 0, x: 0, y: 0 });
+  const actionsRef = useRef({ populate: () => {}, clear: () => {}, overview: () => {} });
 
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(true);
@@ -96,11 +125,11 @@ export default function Page() {
     selRef.current = sel;
   }, [sel]);
 
-  const pushFeed = useCallback((kind: EventKind | 'info', t: number, text: string) => {
-    feedRef.current = [{ id: feedIdRef.current++, kind, t, text }, ...feedRef.current].slice(0, 3);
+  const pushFeed = useCallback((kind: FeedItemKind, t: number, text: string) => {
+    feedRef.current = [{ id: feedIdRef.current++, kind, t, text: text || FEED_WORDS[kind] }, ...feedRef.current].slice(0, 3);
   }, []);
 
-  /* ---------- PWA: service worker + установка ---------- */
+  /* ---------- PWA ---------- */
 
   useEffect(() => {
     if (process.env.NODE_ENV === 'production' && 'serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
@@ -129,101 +158,7 @@ export default function Page() {
     setInstallReady(false);
   }, []);
 
-  /* ---------- камера ---------- */
-
-  const minScale = useCallback(() => {
-    const { w, h } = sizeRef.current;
-    return (Math.min(w, h) / (engineRef.current?.grid ?? 64)) * 0.9;
-  }, []);
-
-  const maxScale = useCallback(() => {
-    const { w, h } = sizeRef.current;
-    return Math.min(w, h) * 2;
-  }, []);
-
-  const clampCam = useCallback(() => {
-    const cam = camRef.current;
-    const g = engineRef.current?.grid ?? 64;
-    cam.scale = clamp(cam.scale, minScale(), maxScale());
-    cam.x = clamp(cam.x, -1.5, g + 1.5);
-    cam.y = clamp(cam.y, -1.5, g + 1.5);
-  }, [minScale, maxScale]);
-
-  const zoomAt = useCallback(
-    (px: number, py: number, factor: number) => {
-      const cam = camRef.current;
-      const { w, h } = sizeRef.current;
-      animRef.current = null;
-      const wx = cam.x + (px - w / 2) / cam.scale;
-      const wy = cam.y + (h / 2 - py) / cam.scale;
-      cam.scale = clamp(cam.scale * factor, minScale(), maxScale());
-      cam.x = wx - (px - w / 2) / cam.scale;
-      cam.y = wy - (h / 2 - py) / cam.scale;
-      clampCam();
-    },
-    [minScale, maxScale, clampCam],
-  );
-
-  const flyTo = useCallback((x: number, y: number, scale: number) => {
-    const cam = camRef.current;
-    animRef.current = { t0: performance.now(), dur: 450, from: { ...cam }, to: { x, y, scale } };
-  }, []);
-
-  const screenToWorld = useCallback((px: number, py: number) => {
-    const cam = camRef.current;
-    const { w, h } = sizeRef.current;
-    return { x: cam.x + (px - w / 2) / cam.scale, y: cam.y + (h / 2 - py) / cam.scale };
-  }, []);
-
-  const visRect = useCallback((): PondRect | null => {
-    const eng = engineRef.current;
-    if (!eng) return null;
-    const cam = camRef.current;
-    const { w, h } = sizeRef.current;
-    const g = eng.grid;
-    const x0 = clamp(Math.floor(cam.x - w / (2 * cam.scale)), 0, g - 1);
-    const x1 = clamp(Math.ceil(cam.x + w / (2 * cam.scale)) - 1, 0, g - 1);
-    const y0 = clamp(Math.floor(cam.y - h / (2 * cam.scale)), 0, g - 1);
-    const y1 = clamp(Math.ceil(cam.y + h / (2 * cam.scale)) - 1, 0, g - 1);
-    const rw = x1 - x0 + 1;
-    const rh = y1 - y0 + 1;
-    return { x0, y0, x1, y1, w: rw, h: rh, count: rw * rh };
-  }, []);
-
-  const focusDi = useCallback(() => {
-    const eng = engineRef.current;
-    if (!eng) return 0;
-    const cam = camRef.current;
-    const g = eng.grid;
-    return clamp(Math.floor(cam.y), 0, g - 1) * g + clamp(Math.floor(cam.x), 0, g - 1);
-  }, []);
-
-  /* ---------- заселение ---------- */
-
-  const populateVisible = useCallback(() => {
-    const eng = engineRef.current;
-    if (!eng) return;
-    const rect = visRect();
-    if (!rect) return;
-    for (let y = rect.y0; y <= rect.y1; y++) {
-      for (let x = rect.x0; x <= rect.x1; x++) {
-        eng.place(y * eng.grid + x, Math.floor(Math.random() * SPECIES.length), Math.floor(Math.random() * 4), 26 + Math.random() * 44, 26 + Math.random() * 44);
-      }
-    }
-    guardRef.current = performance.now();
-    pushFeed('info', 0, 'пруд заселён');
-    setRunning(true);
-  }, [visRect, pushFeed]);
-
-  const clearVisible = useCallback(() => {
-    const eng = engineRef.current;
-    if (!eng) return;
-    eng.clearRect(visRect());
-    glowsRef.current = [];
-    pushFeed('info', 0, 'блюдца очищены');
-  }, [visRect, pushFeed]);
-
-  /* ---------- монтирование ---------- */
+  /* ---------- монтирование: движок, мир, ввод, цикл ---------- */
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -237,62 +172,205 @@ export default function Page() {
       return;
     }
     engineRef.current = engine;
+    const world = new Biosphere();
+    worldRef.current = world;
     const octx = overlay.getContext('2d');
 
-    const g = engine.grid;
+    const S = engine.slots;
     const coarse = window.matchMedia('(pointer: coarse)').matches;
     const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1.5 : 2);
+    if (engine.softGL) budgetRef.current = 0.35; // программный рендер — беречь
 
     const resize = () => {
       const w = canvas.clientWidth;
       const h = canvas.clientHeight;
       if (w === 0 || h === 0) return;
       sizeRef.current = { w, h, dpr };
-      canvas.width = Math.round(w * dpr);
-      canvas.height = Math.round(h * dpr);
-      overlay.width = w; // оверлей в CSS-пикселях — дешёвые вспышки
+      canvas.width = Math.max(2, Math.round(w * dpr * rsRef.current));
+      canvas.height = Math.max(2, Math.round(h * dpr * rsRef.current));
+      overlay.width = w;
       overlay.height = h;
       clampCam();
     };
-    const ro = new ResizeObserver(resize);
-    ro.observe(canvas);
-    resize();
 
-    const cam = camRef.current;
-    cam.x = g / 2;
-    cam.y = g / 2;
+    const minScale = () => MIN_SCALE;
+    const maxScale = () => Math.min(sizeRef.current.w, sizeRef.current.h) * 2 || 800;
+    const clampCam = () => {
+      const cam = camRef.current;
+      cam.scale = clamp(cam.scale, minScale(), maxScale());
+    };
+
+    const winOrgRef = { current: { x: -(S >> 1), y: -(S >> 1) } };
+    const metaOrgRef = { current: { x: 0, y: 0 } };
+    const rsRef = { current: engine.softGL ? 0.5 : 1 }; // адаптивное разрешение рендера (медленным устройствам — меньше пикселей)
+    const slotTable = new Map<number, EcoRec>();
+    const freeSlots: number[] = [];
+    for (let i = 0; i < S * S; i++) freeSlots.push(i);
+
+    /* ---- слоты: материализация видимых блюдц ---- */
+
+    const writeBack = (r: EcoRec) => {
+      r.pop = r.mass > 0.01 ? clamp(r.mass * 30, 0.5, 14) : r.pop * 0.85;
+      r.mat = -1;
+    };
+    const dropSlot = (slot: number, r: EcoRec) => {
+      writeBack(r);
+      slotTable.delete(slot);
+      freeSlots.push(slot);
+    };
+    const takeSlot = (cdx: number, cdy: number): number => {
+      if (freeSlots.length) return freeSlots.pop()!;
+      let bestSlot = -1;
+      let bestD = -1;
+      for (const [slot, r] of slotTable) {
+        const d = Math.abs(r.wx - cdx) + Math.abs(r.wy - cdy);
+        if (d > bestD) {
+          bestD = d;
+          bestSlot = slot;
+        }
+      }
+      if (bestSlot >= 0 && bestD > 4) {
+        dropSlot(bestSlot, slotTable.get(bestSlot)!);
+        return bestSlot;
+      }
+      return -1;
+    };
+    const cnt = (r: EcoRec) => clamp(Math.round(r.pop / 2.2), 1, 6);
+
+    /* ---- камера ---- */
+
+    const zoomAt = (px: number, py: number, factor: number) => {
+      const cam = camRef.current;
+      const { w, h } = sizeRef.current;
+      animRef.current = null;
+      const wx = cam.x + (px - w / 2) / cam.scale;
+      const wy = cam.y + (h / 2 - py) / cam.scale;
+      cam.scale = clamp(cam.scale * factor, minScale(), maxScale());
+      cam.x = wx - (px - w / 2) / cam.scale;
+      cam.y = wy - (h / 2 - py) / cam.scale;
+    };
+
+    const flyTo = (x: number, y: number, scale: number) => {
+      const cam = camRef.current;
+      animRef.current = { t0: performance.now(), dur: 450, from: { ...cam }, to: { x, y, scale: clamp(scale, minScale(), maxScale()) } };
+    };
+
+    const screenToWorld = (px: number, py: number) => {
+      const cam = camRef.current;
+      const { w, h } = sizeRef.current;
+      return { x: cam.x + (px - w / 2) / cam.scale, y: cam.y + (h / 2 - py) / cam.scale };
+    };
+
+    /* ---- экосистемные события (GPU-хуки для тика биосферы) ---- */
+
+    const hooks = {
+      perturb: (slot: number, mode: number, seed: number) => engine.perturb(slot, mode, seed),
+      clearSlot: (slot: number) => engine.clearSlot(slot),
+      placeImmigrant: (slot: number, sp: number) => engine.place(slot, sp, Math.floor(Math.random() * 4), 16 + Math.random() * 64, 16 + Math.random() * 64),
+      feed: (kind: FeedKind, _wx: number, _wy: number) => pushFeed(kind, world.time, FEED_WORDS[kind]),
+    };
+
+    /* ---- старт: жизнь у начала координат ---- */
+
     const q = new URLSearchParams(window.location.search);
-    cam.scale = q.get('zoom') === 'fit' ? minScale() : Math.min(sizeRef.current.w, sizeRef.current.h) || 600;
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        if (Math.random() < 0.75) world.seedDish(dx, dy, Math.floor(Math.random() * SPECIES.length), 3 + Math.random() * 6);
+        else world.killDish(dx, dy);
+      }
+    }
+    resize();
+    const cam0 = camRef.current;
+    cam0.x = 0.5;
+    cam0.y = 0.5;
+    cam0.scale = q.get('zoom') === 'fit' ? minScale() : (Math.min(sizeRef.current.w, sizeRef.current.h) || 900) / 3.6;
     if (q.has('pause')) {
       runningRef.current = false;
       queueMicrotask(() => setRunning(false));
     }
     const sp0 = q.get('speed');
-    if (sp0 && SPEEDS.includes(parseInt(sp0, 10))) {
-      const idx = SPEEDS.indexOf(parseInt(sp0, 10));
+    if (sp0 && SPEEDS.includes(parseFloat(sp0))) {
+      const idx = SPEEDS.indexOf(parseFloat(sp0));
       speedRef.current = SPEEDS[idx];
       queueMicrotask(() => setSpeedIdx(idx));
     }
+    const mox = Math.floor((0 - META / 2) / 16) * 16;
+    const moy = Math.floor((0 - META / 2) / 16) * 16;
+    metaOrgRef.current = { x: mox, y: moy };
+    engine.setMeta(world.buildMeta(metaOrgRef.current));
 
-    const center = Math.floor(g / 2) * g + Math.floor(g / 2);
-    engine.place(center, 0, 0, DISH / 2, DISH / 2);
-    for (let i = 0; i < 10; i++) {
-      const dx = Math.floor(Math.random() * 9) - 4;
-      const dy = Math.floor(Math.random() * 9) - 4;
-      engine.place(
-        (Math.floor(g / 2) + dy) * g + Math.floor(g / 2) + dx,
-        Math.floor(Math.random() * SPECIES.length),
-        Math.floor(Math.random() * 4),
-        26 + Math.random() * 44,
-        26 + Math.random() * 44,
-      );
-    }
+    /* ---- действия кнопок ---- */
 
-    /* ---------- ввод ---------- */
+    const populate = () => {
+      const cam = camRef.current;
+      const { w, h } = sizeRef.current;
+      const vx0 = Math.floor(cam.x - w / (2 * cam.scale));
+      const vx1 = Math.ceil(cam.x + w / (2 * cam.scale));
+      const vy0 = Math.floor(cam.y - h / (2 * cam.scale));
+      const vy1 = Math.ceil(cam.y + h / (2 * cam.scale));
+      const wo = winOrgRef.current;
+      let real = 0;
+      for (let wy = vy0; wy < vy1; wy++) {
+        for (let wx = vx0; wx < vx1; wx++) {
+          const sp = Math.floor(Math.random() * SPECIES.length);
+          world.seedDish(wx, wy, sp, 4 + Math.random() * 7);
+          if (real < 150 && wx >= wo.x && wy >= wo.y && wx < wo.x + S && wy < wo.y + S && cam.scale >= TEX_PX - 2) {
+            const r = world.peek(wx, wy)!;
+            if (r.mat < 0) {
+              const slot = takeSlot(wx, wy);
+              if (slot >= 0) {
+                engine.seedSlot(slot, sp, cnt(r));
+                r.mat = slot;
+                r.matSerial = r.serial;
+                r.mass = 0.015;
+                slotTable.set(slot, r);
+                real++;
+              }
+            }
+          }
+        }
+      }
+      guardRef.current = performance.now();
+      pushFeed('info', 0, 'жизнь засеяна');
+      setRunning(true);
+    };
+
+    const clear = () => {
+      const cam = camRef.current;
+      const { w, h } = sizeRef.current;
+      const vx0 = Math.floor(cam.x - w / (2 * cam.scale));
+      const vx1 = Math.ceil(cam.x + w / (2 * cam.scale));
+      const vy0 = Math.floor(cam.y - h / (2 * cam.scale));
+      const vy1 = Math.ceil(cam.y + h / (2 * cam.scale));
+      for (let wy = vy0; wy < vy1; wy++) {
+        for (let wx = vx0; wx < vx1; wx++) {
+          const r = world.peek(wx, wy);
+          if (!r) continue;
+          world.killDish(wx, wy);
+          if (r.mat >= 0) {
+            const slot = r.mat;
+            engine.clearSlot(slot);
+            r.mat = -1;
+            slotTable.delete(slot);
+            freeSlots.push(slot);
+          }
+        }
+      }
+      glowsRef.current = [];
+      pushFeed('info', 0, 'блюдца очищены');
+    };
+
+    const overview = () => flyTo(camRef.current.x, camRef.current.y, minScale());
+
+    actionsRef.current = { populate, clear, overview };
+
+    /* ---- ввод ---- */
 
     type P = { x: number; y: number; sx: number; sy: number; t: number; moved: boolean };
     const pointers = new Map<number, P>();
     let pinch: { dist0: number; scale0: number; wx: number; wy: number } | null = null;
+
+    const focusDish = () => ({ x: Math.floor(camRef.current.x), y: Math.floor(camRef.current.y) });
 
     const tapAt = (px: number, py: number) => {
       const now = performance.now();
@@ -300,20 +378,40 @@ export default function Page() {
       const isDouble = now - lt.t < 320 && Math.hypot(px - lt.x, py - lt.y) < 36;
       lastTapRef.current = { t: now, x: px, y: py };
       const wpt = screenToWorld(px, py);
-      if (wpt.x < 0 || wpt.y < 0 || wpt.x >= g || wpt.y >= g) return;
       const dx = Math.floor(wpt.x);
       const dy = Math.floor(wpt.y);
-      const di = dy * g + dx;
       if (camRef.current.scale >= PLACE_PX) {
-        if (isDouble) return; // случайный второй тап — не сажаем вдвое
-        engine.place(di, selRef.current, Math.floor(Math.random() * 4), (wpt.x - dx) * DISH, (wpt.y - dy) * DISH);
-        guardRef.current = now;
-        pushFeed('info', 0, `посажен: ${SPECIES[selRef.current].ru.toLowerCase()}`);
-      } else if (isDouble) {
-        zoomAt(px, py, 2.2);
-      } else {
-        flyTo(dx + 0.5, dy + 0.5, Math.min(sizeRef.current.w, sizeRef.current.h));
+        const wo = winOrgRef.current;
+        if (dx >= wo.x && dy >= wo.y && dx < wo.x + S && dy < wo.y + S) {
+          if (isDouble) return;
+          const r = world.get(dx, dy);
+          let slot = r.mat;
+          if (slot < 0) {
+            slot = takeSlot(dx, dy);
+            if (slot >= 0) {
+              engine.clearSlot(slot);
+              r.mat = slot;
+              r.matSerial = r.serial;
+              r.mass = Math.max(r.mass, 0.02);
+              slotTable.set(slot, r);
+            }
+          }
+          if (slot >= 0) {
+            engine.place(slot, selRef.current, Math.floor(Math.random() * 4), (wpt.x - dx) * DISH, (wpt.y - dy) * DISH);
+            if (r.sp !== selRef.current) {
+              r.sp = selRef.current;
+              r.pop = Math.max(r.pop, 1);
+              r.serial++;
+              r.matSerial = r.serial;
+            }
+            guardRef.current = now;
+            pushFeed('info', 0, `посажен: ${SPECIES[selRef.current].ru.toLowerCase()}`);
+          }
+          return;
+        }
       }
+      if (isDouble) zoomAt(px, py, 2.2);
+      else flyTo(dx + 0.5, dy + 0.5, Math.min(sizeRef.current.w, sizeRef.current.h));
     };
 
     const onDown = (e: PointerEvent) => {
@@ -327,7 +425,7 @@ export default function Page() {
         const [a, b] = [...pointers.values()];
         const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
         const wm = screenToWorld(mid.x, mid.y);
-        pinch = { dist0: Math.hypot(a.x - b.x, a.y - b.y), scale0: camRef.current.scale, wx: wm.x, wy: wm.y };
+        pinch = { dist0: Math.max(8, Math.hypot(a.x - b.x, a.y - b.y)), scale0: camRef.current.scale, wx: wm.x, wy: wm.y };
       }
     };
 
@@ -345,19 +443,16 @@ export default function Page() {
           animRef.current = null;
           cam2.x -= dx / cam2.scale;
           cam2.y += dy / cam2.scale;
-          clampCam();
         }
       } else if (pointers.size === 2 && pinch) {
         const [a, b] = [...pointers.values()];
-        const dist = Math.hypot(a.x - b.x, a.y - b.y);
-        if (dist < 8) return;
+        const dist = Math.max(8, Math.hypot(a.x - b.x, a.y - b.y));
         const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
         const cam2 = camRef.current;
         animRef.current = null;
         cam2.scale = clamp((pinch.scale0 * dist) / pinch.dist0, minScale(), maxScale());
         cam2.x = pinch.wx - (mid.x - sizeRef.current.w / 2) / cam2.scale;
         cam2.y = pinch.wy - (sizeRef.current.h / 2 - mid.y) / cam2.scale;
-        clampCam();
       }
     };
 
@@ -383,7 +478,6 @@ export default function Page() {
       animRef.current = null;
       cam2.x += dx / cam2.scale;
       cam2.y += dy / cam2.scale;
-      clampCam();
     };
 
     const onKey = (e: KeyboardEvent) => {
@@ -402,12 +496,13 @@ export default function Page() {
           zoomAt(sizeRef.current.w / 2, sizeRef.current.h / 2, 1 / 1.4);
           break;
         case 'Digit0':
-          flyTo(g / 2, g / 2, minScale());
+          overview();
           break;
         case 'Digit1':
         case 'Digit2':
         case 'Digit3':
-        case 'Digit4': {
+        case 'Digit4':
+        case 'Digit5': {
           const idx = parseInt(e.code.slice(-1), 10) - 1;
           if (idx < SPEEDS.length) setSpeedIdx(idx);
           break;
@@ -430,9 +525,8 @@ export default function Page() {
           break;
         case 'KeyR':
         case 'KeyК': {
-          const di = focusDi();
-          engine.clearDish(di);
-          engine.place(di, selRef.current, Math.floor(Math.random() * 4), DISH / 2, DISH / 2);
+          const fd = focusDish();
+          world.seedDish(fd.x, fd.y, selRef.current, 3);
           guardRef.current = performance.now();
           break;
         }
@@ -446,8 +540,10 @@ export default function Page() {
     canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     window.addEventListener('keydown', onKey);
+    const ro = new ResizeObserver(resize);
+    ro.observe(canvas);
 
-    /* ---------- HUD и вспышки ---------- */
+    /* ---- HUD и вспышки ---- */
 
     const drawGlows = (now: number) => {
       if (!octx) return;
@@ -458,19 +554,17 @@ export default function Page() {
         glowsRef.current = cam2.scale < 40 ? [] : glowsRef.current;
         return;
       }
-      const fd = focusDi();
-      const fx = fd % g;
-      const fy = Math.floor(fd / g);
+      const fd = focusDish();
       glowsRef.current = glowsRef.current.filter((gl) => now - gl.born < GLOW_MS);
       for (const gl of glowsRef.current) {
         const age = Math.min(1, (now - gl.born) / GLOW_MS);
-        const wx = fx + (gl.x + 0.5) / DISH;
-        const wy = fy + (gl.y + 0.5) / DISH;
+        const wx = fd.x + (gl.x + 0.5) / DISH;
+        const wy = fd.y + (gl.y + 0.5) / DISH;
         const sx = (wx - cam2.x) * cam2.scale + w / 2;
         const sy = h / 2 - (wy - cam2.y) * cam2.scale;
         const r = (3 + age * 13) * (cam2.scale / DISH);
         octx.globalAlpha = (1 - age) * 0.85;
-        octx.strokeStyle = GLOW_COLORS[gl.kind];
+        octx.strokeStyle = gl.kind === 'birth' ? '#34d399' : gl.kind === 'split' ? '#a3e635' : gl.kind === 'merge' ? '#fbbf24' : '#fb7185';
         octx.lineWidth = 2.2 * (1 - age) + 0.5;
         octx.beginPath();
         octx.arc(sx, sy, r, 0, Math.PI * 2);
@@ -479,49 +573,66 @@ export default function Page() {
       octx.globalAlpha = 1;
     };
 
+    let lastEco = 0;
     let lastStats = 0;
-    let lastDi = -1;
     let lastFrame = 0;
     let frames = 0;
+    let stepAcc = 0;
+    let gateAcc = 0;
+    let cursor = 0;
+    let probeIdx = 0;
+    let matList: { slot: number; r: EcoRec }[] = [];
+    let lastFocus = '';
+    let lastDi = { x: 1 << 30, y: 1 << 30 };
+
     const scan = (now: number) => {
-      const di = focusDi();
-      if (di !== lastDi) {
-        lastDi = di;
+      const fd = focusDish();
+      if (fd.x !== lastDi.x || fd.y !== lastDi.y) {
+        lastDi = fd;
         trackerRef.current.reset();
         glowsRef.current = [];
+        lastFocus = '';
       }
-      const sp = engine.species[di];
-      let st = { mass: 0, pop: 0, blobs: [] as { x: number; y: number; mass: number; size: number }[] };
+      const r = world.get(fd.x, fd.y);
+      let st: PondStats = { mass: 0, pop: 0, blobs: [] };
       let t = 0;
       let events: { kind: EventKind; t: number; x: number; y: number }[] = [];
-      if (sp >= 0) {
-        st = engine.stats(di);
-        t = engine.steps[di] * (1 / engine.speciesList[sp].T);
+      const real = r.mat >= 0 && r.sp >= 0;
+      if (real) {
+        st = engine.stats(r.mat);
+        t = r.matSteps * (1 / SPECIES[r.sp].T);
         const stepsSince = Math.max(1, Math.round(speedRef.current * ((now - lastStats) / 16.7)));
         events = trackerRef.current.update(st.blobs, t, stepsSince);
       } else {
         trackerRef.current.reset();
+        t = Math.round(world.time);
       }
       if (events.length > 0 && now - guardRef.current > 900) {
         for (const ev of events.slice(0, 3)) {
           glowsRef.current.push({ kind: ev.kind, x: ev.x, y: ev.y, born: now });
-          pushFeed(ev.kind, t, EVENT_WORDS[ev.kind]);
+          pushFeed(ev.kind, t, FEED_WORDS[ev.kind]);
         }
       }
       const slider = document.getElementById('climate-slider') as HTMLInputElement | null;
-      if (slider && document.activeElement !== slider) slider.value = String(engine.climate[di]);
-      hudCbRef.current({
-        t,
-        pop: st.pop,
-        fps: Math.round(fpsRef.current),
-        spName: sp >= 0 ? engine.speciesList[sp].ru : 'пусто',
-        climate: engine.climate[di],
-        placeable: camRef.current.scale >= PLACE_PX,
-        events: [...feedRef.current],
-      });
+      if (slider && document.activeElement !== slider) slider.value = String(r.clim);
+      const key = `${r.sp}|${r.mat}`;
+      if (key !== lastFocus || now - lastStats >= STATS_MS) {
+        lastFocus = key;
+        hudCbRef.current({
+          t,
+          pop: real ? st.pop : Math.round(r.pop),
+          fps: Math.round(fpsRef.current),
+          spName: r.sp >= 0 ? SPECIES[r.sp].ru : 'пусто',
+          climate: r.clim,
+          placeable: camRef.current.scale >= PLACE_PX,
+          real,
+          planet: world.aliveNear(24),
+          events: [...feedRef.current],
+        });
+      }
     };
 
-    /* ---------- цикл ---------- */
+    /* ---- главный цикл ---- */
 
     const loop = (now: number) => {
       try {
@@ -534,10 +645,18 @@ export default function Page() {
         }
         lastFrame = now;
 
-        // адаптивный бюджет: кадр дорог — режем, дешёв — наращиваем
-        if (++frames % 30 === 0) {
-          if (emaRef.current > 22) budgetRef.current = Math.max(3, Math.floor(budgetRef.current * 0.75));
-          else if (emaRef.current < 15) budgetRef.current = Math.min(96, budgetRef.current + 4);
+        // адаптация под устройство: бюджет шагов и разрешение рендера (цель — не ниже ~50 fps)
+        if (++frames % 20 === 0) {
+          if (emaRef.current > 19) budgetRef.current = Math.max(0.05, budgetRef.current * (emaRef.current > 35 ? 0.6 : 0.78));
+          else if (emaRef.current < 15) budgetRef.current = Math.min(engine.softGL ? 2 : 400, budgetRef.current * 1.3 + 2);
+          const rs = rsRef.current;
+          if (emaRef.current > 24 && rs > 0.4) {
+            rsRef.current = Math.max(0.4, rs * 0.8);
+            resize();
+          } else if (emaRef.current < 13 && rs < 1) {
+            rsRef.current = Math.min(1, rs * 1.15);
+            resize();
+          }
         }
 
         const anim = animRef.current;
@@ -552,14 +671,128 @@ export default function Page() {
           clampCam();
         }
 
-        const rect = visRect();
-        visRef.current = rect;
-        if (rect && runningRef.current) engine.distribute(rect, budgetRef.current, speedRef.current);
+        const cam = camRef.current;
+        const { w, h } = sizeRef.current;
+        const cdx = Math.floor(cam.x);
+        const cdy = Math.floor(cam.y);
 
-        focusRef.current = focusDi();
-        engine.render(camRef.current, { x: focusRef.current % g, y: Math.floor(focusRef.current / g) }, now / 1000, dpr);
+        // видимая область в блюдцах (мир бесконечен — без клампа)
+        const vx0 = Math.floor(cam.x - w / (2 * cam.scale));
+        const vx1 = Math.ceil(cam.x + w / (2 * cam.scale));
+        const vy0 = Math.floor(cam.y - h / (2 * cam.scale));
+        const vy1 = Math.ceil(cam.y + h / (2 * cam.scale));
+        visRef.current = { x0: vx0, y0: vy0, x1: vx1, y1: vy1, count: (vx1 - vx0) * (vy1 - vy0) };
+
+        // окно слотов следует за камерой
+        const wo = winOrgRef.current;
+        if (Math.abs(cdx - (wo.x + S / 2)) > S / 4 || Math.abs(cdy - (wo.y + S / 2)) > S / 4) {
+          const nx = cdx - (S >> 1);
+          const ny = cdy - (S >> 1);
+          for (const [slot, r] of slotTable) {
+            if (r.wx < nx || r.wy < ny || r.wx >= nx + S || r.wy >= ny + S) dropSlot(slot, r);
+          }
+          winOrgRef.current = { x: nx, y: ny };
+        }
+
+        // мета-текстура планеты следует за камерой
+        const mo = metaOrgRef.current;
+        const mx = Math.floor((cdx - META / 2) / 16) * 16;
+        const my = Math.floor((cdy - META / 2) / 16) * 16;
+        if (mo.x !== mx || mo.y !== my) {
+          metaOrgRef.current = { x: mx, y: my };
+          engine.setMeta(world.buildMeta(metaOrgRef.current));
+        }
+
+        // скан видимых блюдц: материализация + список на шаги
+        const wo2 = winOrgRef.current;
+        const wx0 = Math.max(vx0, wo2.x);
+        const wx1 = Math.min(vx1, wo2.x + S);
+        const wy0 = Math.max(vy0, wo2.y);
+        const wy1 = Math.min(vy1, wo2.y + S);
+        matList = [];
+        let ops = 0;
+        if (wx1 > wx0 && wy1 > wy0) {
+          const yOrder: number[] = [];
+          for (let d = 0; yOrder.length < wy1 - wy0; d++) {
+            if (cdy + d < wy1) yOrder.push(cdy + d);
+            if (d > 0 && cdy - d >= wy0) yOrder.push(cdy - d);
+          }
+          const xOrder: number[] = [];
+          for (let d = 0; xOrder.length < wx1 - wx0; d++) {
+            if (cdx + d < wx1) xOrder.push(cdx + d);
+            if (d > 0 && cdx - d >= wx0) xOrder.push(cdx - d);
+          }
+          for (const wy of yOrder) {
+            for (const wx of xOrder) {
+              const r = world.get(wx, wy);
+              if (r.mat >= 0) {
+                if (r.sp < 0) continue; // вымерло — тик уже очистил
+                if (r.serial !== r.matSerial) {
+                  if (ops < MAT_OPS) {
+                    engine.seedSlot(r.mat, r.sp, cnt(r));
+                    r.matSerial = r.serial;
+                    r.mass = 0.015;
+                    ops++;
+                  }
+                } else {
+                  matList.push({ slot: r.mat, r });
+                }
+              } else if (r.sp >= 0 && r.pop > 0.5 && cam.scale >= TEX_PX - 2 && ops < MAT_OPS) {
+                const slot = takeSlot(cdx, cdy);
+                if (slot < 0) {
+                  ops = MAT_OPS;
+                } else {
+                  engine.seedSlot(slot, r.sp, cnt(r));
+                  r.mat = slot;
+                  r.matSerial = r.serial;
+                  r.mass = 0.015;
+                  slotTable.set(slot, r);
+                  ops++;
+                  matList.push({ slot, r });
+                }
+              }
+            }
+          }
+          // слоты, ушедшие с экрана, сворачиваются в статистику
+          for (const [slot, r] of slotTable) {
+            if (r.wx < vx0 || r.wx >= vx1 || r.wy < vy0 || r.wy >= vy1) dropSlot(slot, r);
+          }
+        }
+
+        // честные шаги Lenia: каждое блюдце хочет speed шагов/кадр,
+        // устройство даёт budget шагов/кадр всего (дробный — и часть кадра)
+        if (runningRef.current && matList.length > 0) {
+          stepAcc += speedRef.current;
+          const perDish = Math.floor(stepAcc);
+          stepAcc -= perDish;
+          gateAcc += budgetRef.current;
+          const gateCap = Math.max(8, budgetRef.current);
+          if (gateAcc > gateCap) gateAcc = gateCap;
+          const supply = Math.floor(gateAcc);
+          gateAcc -= supply;
+          const n = Math.min(perDish * matList.length, supply);
+          for (let i = 0; i < n; i++) {
+            const it = matList[cursor++ % matList.length];
+            engine.stepSlot(it.slot, dishParams(it.r));
+            it.r.matSteps++;
+          }
+        }
+
+        // пробы массы (редукция на GPU, чтение 4 байт) — через кадр, чтобы не стопорить конвейер
+        if (matList.length > 0 && (frames & 1) === 0) {
+          const it = matList[probeIdx++ % matList.length];
+          it.r.mass = engine.probeMass(it.slot);
+        }
+
+        engine.render(cam, winOrgRef.current, metaOrgRef.current, { x: cdx, y: cdy }, now / 1000, speedRef.current, dpr * rsRef.current);
         drawGlows(now);
 
+        if (now - lastEco >= ECO_MS) {
+          lastEco = now;
+          world.setCamera(cdx, cdy);
+          world.tick(0.5 * speedRef.current, hooks);
+          engine.setMeta(world.buildMeta(metaOrgRef.current));
+        }
         if (now - lastStats >= STATS_MS) {
           scan(now);
           lastStats = now;
@@ -581,25 +814,75 @@ export default function Page() {
       cam: () => ({ ...camRef.current }),
       setCam: (x: number, y: number, scale: number) => {
         animRef.current = null;
-        camRef.current = { x, y, scale };
-        clampCam();
+        camRef.current = { x, y, scale: clamp(scale, minScale(), maxScale()) };
       },
-      grid: g,
-      dishes: g * g,
+      speed: (v?: number) => {
+        if (v !== undefined) speedRef.current = v;
+        return speedRef.current;
+      },
       vis: () => visRef.current,
-      focus: () => focusRef.current,
-      stats: (di?: number) => engine.stats(di ?? focusDi()),
-      info: (di: number) => ({ sp: engine.species[di], climate: engine.climate[di], steps: engine.steps[di] }),
-      budget: () => budgetRef.current,
-      fps: () => fpsRef.current,
-      populate: populateVisible,
-      clear: clearVisible,
-      place: (di: number, sp: number, rot = 0) => engine.place(di, sp, rot, DISH / 2, DISH / 2),
-      step: (di: number, n: number) => {
-        for (let i = 0; i < n; i++) engine.stepDish(di);
+      win: () => ({ ...winOrgRef.current }),
+      meta: () => ({ ...metaOrgRef.current }),
+      slots: S,
+      matCount: () => slotTable.size,
+      eco: (wx: number, wy: number) => {
+        const r = world.get(wx, wy);
+        return { sp: r.sp, spName: r.sp >= 0 ? SPECIES[r.sp].ru : '-', pop: r.pop, mass: r.mass, clim: r.clim, mat: r.mat, serial: r.serial, mut: [...r.mut], time: world.time };
       },
-      setClimate: (di: number, k: number) => engine.setClimate(di, k),
+      aliveNear: (rad: number) => world.aliveNear(rad),
+      tick: (n = 1) => {
+        for (let i = 0; i < n; i++) world.tick(0.5, hooks);
+        engine.setMeta(world.buildMeta(metaOrgRef.current));
+      },
+      probe: (wx: number, wy: number) => {
+        const r = world.get(wx, wy);
+        return r.mat >= 0 ? engine.probeMass(r.mat) : r.mass;
+      },
+      stepDish: (wx: number, wy: number, n: number) => {
+        const r = world.get(wx, wy);
+        if (r.mat >= 0 && r.sp >= 0) {
+          for (let i = 0; i < n; i++) engine.stepSlot(r.mat, dishParams(r));
+          r.matSteps += n;
+        }
+      },
+      seedDish: (wx: number, wy: number, sp: number, pop = 6) => world.seedDish(wx, wy, sp, pop),
+      killDish: (wx: number, wy: number) => world.killDish(wx, wy),
+      perturb: (wx: number, wy: number, mode: number) => {
+        const r = world.get(wx, wy);
+        if (r.mat >= 0) engine.perturb(r.mat, mode, Math.random() * 100);
+      },
+      stats: () => {
+        const fd = focusDish();
+        const r = world.get(fd.x, fd.y);
+        return r.mat >= 0 ? engine.stats(r.mat) : { mass: 0, pop: 0, blobs: [] };
+      },
+      focusInfo: () => {
+        const fd = focusDish();
+        const r = world.get(fd.x, fd.y);
+        return { dish: fd, sp: r.sp, spName: r.sp >= 0 ? SPECIES[r.sp].ru : '-', pop: r.pop, mass: r.mass, clim: r.clim, mat: r.mat, serial: r.serial, mut: [...r.mut], time: world.time, steps: r.matSteps };
+      },
+      budget: (v?: number) => {
+        if (v !== undefined) budgetRef.current = v;
+        return budgetRef.current;
+      },
+      dbg: () => ({
+        running: runningRef.current,
+        speed: speedRef.current,
+        budget: budgetRef.current,
+        matLen: matList.length,
+        matSample: matList.slice(0, 4).map((it) => ({ slot: it.slot, wx: it.r.wx, wy: it.r.wy, sp: it.r.sp, steps: it.r.matSteps })),
+        ema: +emaRef.current.toFixed(1),
+        stepAcc: +stepAcc.toFixed(2),
+        slotCount: slotTable.size,
+      }),
+      fps: () => fpsRef.current,
       speciesCount: SPECIES.length,
+      place: (wx: number, wy: number, sp: number) => {
+        const r = world.get(wx, wy);
+        if (r.mat >= 0) engine.place(r.mat, sp, 0, DISH / 2, DISH / 2);
+      },
+      populate,
+      clear,
     };
 
     let wasRunning = true;
@@ -625,11 +908,14 @@ export default function Page() {
       ro.disconnect();
       engine.destroy();
       engineRef.current = null;
+      worldRef.current = null;
       delete (window as unknown as { __pond?: object }).__pond;
     };
-  }, [clampCam, minScale, maxScale, zoomAt, flyTo, screenToWorld, visRect, focusDi, populateVisible, clearVisible, pushFeed]);
+  }, [pushFeed]);
 
   /* ---------- рендер ---------- */
+
+  const speedLabel = SPEEDS[speedIdx] === 0.5 ? '×½' : `×${SPEEDS[speedIdx]}`;
 
   return (
     <div className="fixed inset-0 overflow-hidden bg-[#040806] text-neutral-100" style={{ touchAction: 'none' }}>
@@ -645,10 +931,8 @@ export default function Page() {
         </div>
       )}
 
-      {/* статистика наблюдаемого блюдца */}
       <Hud callbackRef={hudCbRef} />
 
-      {/* рейка управления справа */}
       <div className="rail absolute right-[max(0.75rem,env(safe-area-inset-right))] top-[max(0.75rem,env(safe-area-inset-top))] z-20">
         <RailBtn onClick={() => setRunning((r) => !r)} testid="playpause" label={running ? 'Пауза' : 'Пуск'} active>
           {running ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5" />}
@@ -657,17 +941,17 @@ export default function Page() {
         <button
           onClick={() => setSpeedIdx((i) => (i + 1) % SPEEDS.length)}
           data-testid="speed"
-          aria-label="Скорость"
+          aria-label="Скорость времени"
           className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/10 bg-black/55 font-mono text-[13px] font-bold text-emerald-200 backdrop-blur transition-colors active:bg-emerald-900/50"
         >
-          ×{SPEEDS[speedIdx]}
+          {speedLabel}
         </button>
 
-        <RailBtn onClick={populateVisible} testid="populate" label="Заселить видимые блюдца">
+        <RailBtn onClick={() => actionsRef.current.populate()} testid="populate" label="Заселить видимые блюдца">
           <Sprout className="h-5 w-5" />
         </RailBtn>
 
-        <RailBtn onClick={clearVisible} testid="clear" label="Очистить видимые блюдца">
+        <RailBtn onClick={() => actionsRef.current.clear()} testid="clear" label="Очистить видимые блюдца">
           <Trash2 className="h-5 w-5" />
         </RailBtn>
 
@@ -675,11 +959,7 @@ export default function Page() {
           <Thermometer className="h-5 w-5" />
         </RailBtn>
 
-        <RailBtn
-          onClick={() => flyTo(engineRef.current ? engineRef.current.grid / 2 : 32, engineRef.current ? engineRef.current.grid / 2 : 32, minScale())}
-          testid="fit"
-          label="Весь пруд"
-        >
+        <RailBtn onClick={() => actionsRef.current.overview()} testid="fit" label="Обзор планеты">
           <Maximize className="h-5 w-5" />
         </RailBtn>
 
@@ -690,20 +970,44 @@ export default function Page() {
         )}
       </div>
 
-      {/* климат наблюдаемого блюдца */}
-      {climateOpen && <ClimatePanel onClose={() => setClimateOpen(false)} onSet={(k) => engineRef.current?.setClimate(focusDi(), k)} />}
+      {climateOpen && (
+        <ClimatePanel
+          onClose={() => setClimateOpen(false)}
+          onSet={(k) => {
+            const w = worldRef.current;
+            const cam = camRef.current;
+            if (!w) return;
+            w.setClimate(Math.floor(cam.x), Math.floor(cam.y), k);
+          }}
+        />
+      )}
 
-      {/* зум-кнопки: только на десктопе (на телефоне — щипок) */}
       <div className="pointer-events-none absolute bottom-[max(5.5rem,calc(env(safe-area-inset-bottom)+5.5rem))] right-[max(0.75rem,env(safe-area-inset-right))] z-20 hidden flex-col gap-1.5 [@media(pointer:fine)]:flex">
         <button
-          onClick={() => zoomAt(sizeRef.current.w / 2, sizeRef.current.h / 2, 1.6)}
+          onClick={() => {
+            const { w, h } = sizeRef.current;
+            const cam = camRef.current;
+            animRef.current = null;
+            const px = w / 2;
+            const py = h / 2;
+            const wx = cam.x + (px - w / 2) / cam.scale;
+            const wy = cam.y + (h / 2 - py) / cam.scale;
+            cam.scale = Math.min(cam.scale * 1.6, Math.min(w, h) * 2 || 800);
+            cam.x = wx;
+            cam.y = wy;
+          }}
           aria-label="Приблизить"
           className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-black/55 text-neutral-300 backdrop-blur transition-colors hover:bg-white/10"
         >
           <Plus className="h-4 w-4" />
         </button>
         <button
-          onClick={() => zoomAt(sizeRef.current.w / 2, sizeRef.current.h / 2, 1 / 1.6)}
+          onClick={() => {
+            const { w, h } = sizeRef.current;
+            const cam = camRef.current;
+            animRef.current = null;
+            cam.scale = Math.max(cam.scale / 1.6, 3);
+          }}
           aria-label="Отдалить"
           className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-black/55 text-neutral-300 backdrop-blur transition-colors hover:bg-white/10"
         >
@@ -711,7 +1015,6 @@ export default function Page() {
         </button>
       </div>
 
-      {/* виды */}
       <div
         className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-2"
         style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}
@@ -803,7 +1106,7 @@ function ClimatePanel({ onClose, onSet }: { onClose: () => void; onSet: (k: numb
 /* ---------- HUD: наблюдение за блюдцем под центром ---------- */
 
 function Hud({ callbackRef }: { callbackRef: { current: (s: HudSnap) => void } }) {
-  const [snap, setSnap] = useState<HudSnap>({ t: 0, pop: 0, fps: 0, spName: '', climate: 0.5, placeable: false, events: [] });
+  const [snap, setSnap] = useState<HudSnap>({ t: 0, pop: 0, fps: 0, spName: '', climate: 0.5, placeable: false, real: false, planet: 0, events: [] });
 
   useEffect(() => {
     callbackRef.current = setSnap;
@@ -826,23 +1129,12 @@ function Hud({ callbackRef }: { callbackRef: { current: (s: HudSnap) => void } }
           {snap.spName !== 'пусто' && <> · {climateWord(snap.climate)}</>}
         </p>
         <p className="font-mono text-[9px] tabular-nums text-neutral-600">
-          шаг {snap.t.toFixed(0)} · {snap.fps} fps
+          {snap.real ? `шаг ${snap.t.toFixed(0)}` : `эпоха ${snap.t}`} · {snap.fps} fps · планета {snap.planet}
         </p>
       </div>
       <div className="max-w-full" data-testid="feed">
         {snap.events.slice(0, 2).map((e) => (
-          <p
-            key={e.id}
-            className={`truncate font-mono text-[10px] leading-4 backdrop-blur-sm ${
-              e.kind === 'birth'
-                ? 'text-emerald-300/90'
-                : e.kind === 'split'
-                  ? 'text-lime-300/90'
-                  : e.kind === 'death'
-                    ? 'text-rose-300/80'
-                    : 'text-neutral-400/80'
-            }`}
-          >
+          <p key={e.id} className={`truncate font-mono text-[10px] leading-4 backdrop-blur-sm ${FEED_COLORS[e.kind]}`}>
             {e.text}
           </p>
         ))}

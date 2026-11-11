@@ -403,3 +403,10 @@ export function rotateCells(cells: number[], w: number, h: number, quarterTurns:
 export const POND_ECOTYPES: Record<string, { m?: number; s?: number }> = {
   GH2l: { s: 0.0396 },
 };
+
+/** Готовый список видов пруда (с экотипами) — общий для движка и биосферы. */
+export const POND_LIST: Creature[] = POND_SPECIES.map((id) => {
+  const c = CREATURES.find((x) => x.id === id)!;
+  const eco = POND_ECOTYPES[id];
+  return eco ? { ...c, ...eco } : c;
+}).filter(Boolean);
