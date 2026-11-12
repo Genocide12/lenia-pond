@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Plus, Minus, Maximize, Sprout, Trash2, Download } from 'lucide-react';
 import { POND_LIST, type Creature } from '@/lib/lenia/creatures';
 import { PondEngine, speciesColorJS, DISH, WORLD, LOD_LO, LOD_HI, type PondStats } from '@/lib/lenia/engine';
-import { Biosphere, POP_PER_MASS, type EcoRec, type FeedKind } from '@/lib/lenia/eco';
+import { Biosphere, POP_PER_MASS, type EcoRec } from '@/lib/lenia/eco';
 import { BlobTracker, type EventKind } from '@/lib/lenia/tracker';
 
 const SPEED_MIN = 1;
@@ -19,53 +19,9 @@ const MAT_OPS = 24; // новых материализаций за кадр (п
 const MAT_MS = 200; // как часто пересобирается список желаемых блюдцев
 const BUBBLE_PX = 12; // px на блюдце: 12..32 — материализуется пузырь вокруг камеры
 const BUBBLE_R = 12; // радиус пузыря (блюдцев)
+const SPAWN_MS = 200; // период появления организмов при удержании нажатия
 
 const SPECIES: Creature[] = POND_LIST;
-
-type FeedItemKind = EventKind | FeedKind | 'info';
-
-const FEED_COLORS: Record<FeedItemKind, string> = {
-  birth: 'text-emerald-300/90',
-  split: 'text-lime-300/90',
-  merge: 'text-amber-300/90',
-  death: 'text-rose-300/80',
-  virus: 'text-orange-300/90',
-  mut: 'text-amber-200/90',
-  spread: 'text-emerald-300/90',
-  origin: 'text-lime-200/90',
-  extinct: 'text-rose-300/80',
-  speciate: 'text-cyan-300/90',
-  hybrid: 'text-fuchsia-300/90',
-  conquest: 'text-red-300/90',
-  symbiosis: 'text-teal-200/90',
-  hunt: 'text-orange-400/90',
-  info: 'text-neutral-400/80',
-};
-const FEED_WORDS: Record<FeedItemKind, string> = {
-  birth: 'рождение',
-  split: 'деление!',
-  death: 'гибель',
-  merge: 'слияние',
-  virus: 'болезнь!',
-  mut: 'мутация',
-  spread: 'расселение',
-  origin: 'зарождение жизни',
-  extinct: 'вымирание',
-  speciate: 'новый вид!',
-  hybrid: 'гибрид!',
-  conquest: 'завоевание',
-  symbiosis: 'симбиоз',
-  hunt: 'охота',
-  info: '',
-};
-
-const plural = (n: number) => {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return 'существо';
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return 'существа';
-  return 'существ';
-};
 
 const fmtSpeed = (v: number) => '×' + (Math.abs(v - Math.round(v)) < 0.001 ? String(Math.round(v)) : String(Math.round(v * 100) / 100));
 
@@ -82,18 +38,6 @@ interface VisRect {
   x1: number;
   y1: number;
   count: number;
-}
-
-export interface HudSnap {
-  t: number;
-  pop: number;
-  fps: number;
-  spName: string;
-  spRole: string;
-  real: boolean;
-  planet: number;
-  species: number;
-  events: { id: number; kind: FeedItemKind; t: number; text: string }[];
 }
 
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
@@ -119,9 +63,6 @@ export default function Page() {
   const visRef = useRef<VisRect | null>(null);
   const guardRef = useRef(0);
   const glowsRef = useRef<Glow[]>([]);
-  const feedRef = useRef<{ id: number; kind: FeedItemKind; t: number; text: string }[]>([]);
-  const feedIdRef = useRef(1);
-  const hudCbRef = useRef<(s: HudSnap) => void>(() => {});
   const trackerRef = useRef(new BlobTracker(DISH));
   const installEvtRef = useRef<Event | null>(null);
   const lastTapRef = useRef({ t: 0, x: 0, y: 0 });
@@ -146,10 +87,6 @@ export default function Page() {
   useEffect(() => {
     selRef.current = sel;
   }, [sel]);
-
-  const pushFeed = useCallback((kind: FeedItemKind, t: number, text: string) => {
-    feedRef.current = [{ id: feedIdRef.current++, kind, t, text: text || FEED_WORDS[kind] }, ...feedRef.current].slice(0, 3);
-  }, []);
 
   /* ---------- PWA ---------- */
 
@@ -357,7 +294,9 @@ export default function Page() {
         const [lx, ly] = wallPos(fromDir);
         engine.placeAdd(slot, world.speciesBase(sp), Math.floor(Math.random() * 4), lx, ly);
       },
-      feed: (kind: FeedKind, _wx: number, _wy: number, text?: string) => pushFeed(kind, world.time, text || FEED_WORDS[kind]),
+      feed: () => {
+        /* текстового лога жизни больше нет — события видны вспышками */
+      },
     };
 
     /* ---- старт: обзор всей планеты, жизнь зародится сама ---- */
@@ -382,10 +321,7 @@ export default function Page() {
     /* ---- действия кнопок ---- */
 
     const populate = () => {
-      if (!runningRef.current) {
-        pushFeed('info', 0, 'на паузе — возобнови эволюцию, чтобы заселять');
-        return;
-      }
+      if (!runningRef.current) return;
       // зарождение жизни: ОДНО блюдце, ОДИН вид — маленькая колония
       // выбранных существ рядом с центром обзора
       const cam = camRef.current;
@@ -405,13 +341,9 @@ export default function Page() {
           }
         }
       }
-      if (!best) {
-        pushFeed('info', 0, 'рядом нет свободного блюдца — отдались или очисти место');
-        return;
-      }
+      if (!best) return;
       seedSafe(best.x, best.y, sp, 4);
       guardRef.current = performance.now();
-      pushFeed('origin', world.time, `жизнь зародилась: ${SPECIES[sp].ru.toLowerCase()}`);
     };
 
     // «Очистить» стирает ВСЮ планету: каждое блюдце, вся жизнь
@@ -426,9 +358,7 @@ export default function Page() {
       world.reset(); // новая история зарождений
       engine.setMetaFull(world.metaBytes());
       glowsRef.current = [];
-      feedRef.current = [];
       trackerRef.current.reset();
-      pushFeed('info', 0, 'планета очищена — жизнь зарождается заново');
     };
 
     const overview = () => flyTo(WORLD / 2, WORLD / 2, minScale());
@@ -443,46 +373,84 @@ export default function Page() {
 
     const focusDish = () => ({ x: Math.floor(camRef.current.x), y: Math.floor(camRef.current.y) });
 
-    const tapAt = (px: number, py: number) => {
-      const now = performance.now();
-      const lt = lastTapRef.current;
-      const isDouble = now - lt.t < 320 && Math.hypot(px - lt.x, py - lt.y) < 36;
-      lastTapRef.current = { t: now, x: px, y: py };
+    /* ---- поселение организмов ---- */
+
+    /** Поселить ОДИН организм вида sp в блюдце (wx, wy), локально в (lx, ly).
+     *  Никогда не трогает чужую жизнь: пустое блюдце — новая колония,
+     *  свой вид — подселение в колонию, чужой вид — ближайшее свободное
+     *  блюдце рядом. Никто никого не убивает и не заменяет. */
+    const placeWorld = (wx: number, wy: number, sp: number, lx: number, ly: number): boolean => {
+      if (!world.inWorld(wx, wy)) return false;
+      const had = world.peek(wx, wy);
+      let tx = wx;
+      let ty = wy;
+      if (had && world.speciesBase(had.sp) !== sp) {
+        // в чужом блюдце новая жизнь не селится — ищем свободное рядом,
+        // чтобы хозяин продолжал жить своей физикой
+        let found: { x: number; y: number } | null = null;
+        for (let rad = 1; rad <= 8 && !found; rad++) {
+          for (let dy2 = -rad; dy2 <= rad && !found; dy2++) {
+            for (let dx2 = -rad; dx2 <= rad && !found; dx2++) {
+              if (Math.max(Math.abs(dx2), Math.abs(dy2)) !== rad) continue;
+              const nx = wx + dx2;
+              const ny = wy + dy2;
+              if (world.inWorld(nx, ny) && !world.peek(nx, ny)) found = { x: nx, y: ny };
+            }
+          }
+        }
+        if (!found) return false; // места рядом нет — жизнь блюдца не трогаем
+        tx = found.x;
+        ty = found.y;
+        lx = DISH / 2 + (Math.random() - 0.5) * 36;
+        ly = DISH / 2 + (Math.random() - 0.5) * 36;
+        world.seedDish(tx, ty, sp, 1);
+      } else if (!had) {
+        world.seedDish(wx, wy, sp, 1);
+      }
+      const r = world.peek(tx, ty);
+      if (!r) return false;
+      let slot = r.mat;
+      if (slot < 0) {
+        slot = allocSlot(world.key(tx, ty));
+        if (slot < 0) return false;
+        r.mat = slot;
+        r.matSerial = r.serial;
+        r.matSteps = 0;
+        r.mass = Math.max(0.004, r.pop / POP_PER_MASS);
+      }
+      engine.placeAdd(slot, sp, Math.floor(Math.random() * 4), lx, ly);
+      r.matSerial = r.serial; // организм уже на GPU — пересев не нужен
+      r.flashKind = 1; // зелёная вспышка «рождение»
+      r.flashUntil = world.time + 0.9;
+      world.touch(r);
+      flushMeta();
+      guardRef.current = performance.now();
+      return true;
+    };
+
+    /* ---- удержание нажатия: организмы появляются, пока держишь ---- */
+
+    let spawnTimer = 0;
+    let spawnPid = -1;
+    const stopSpawn = () => {
+      if (spawnTimer) window.clearInterval(spawnTimer);
+      spawnTimer = 0;
+      spawnPid = -1;
+    };
+    const spawnAt = (px: number, py: number): boolean => {
+      if (!runningRef.current) return false;
       const wpt = screenToWorld(px, py);
       const dx = Math.floor(wpt.x);
       const dy = Math.floor(wpt.y);
-      if (camRef.current.scale >= PLACE_PX && world.inWorld(dx, dy)) {
-        if (isDouble) return;
-        if (!runningRef.current) {
-          // на паузе новые организмы не добавляются
-          pushFeed('info', 0, 'на паузе — возобнови эволюцию, чтобы заселять');
-          return;
-        }
-        const sp = selRef.current; // исконный вид из ленты — тело существа
-        const had = world.peek(dx, dy);
-        if (!had) world.seedDish(dx, dy, sp, 1);
-        else if (world.speciesBase(had.sp) !== sp) world.seedDish(dx, dy, sp, Math.max(3, had.pop)); // другой род — новый вид в блюдце
-        const r = world.peek(dx, dy);
-        if (!r) return;
-        let slot = r.mat;
-        if (slot < 0) {
-          slot = allocSlot(world.key(dx, dy));
-          if (slot < 0) return;
-          r.mat = slot;
-          r.matSerial = r.serial;
-          r.matSteps = 0;
-          r.mass = Math.max(0.004, r.pop / POP_PER_MASS);
-          world.touch(r);
-          flushMeta();
-        }
-        engine.placeAdd(slot, sp, Math.floor(Math.random() * 4), (wpt.x - dx) * DISH, (wpt.y - dy) * DISH);
-        r.matSerial = r.serial; // существо уже посажено — пересев не нужен
-        guardRef.current = now;
-        pushFeed('info', 0, `посажен: ${SPECIES[sp].ru.toLowerCase()}`);
-        return;
-      }
-      if (isDouble) zoomAt(px, py, 2.2);
-      else flyTo(clamp(dx + 0.5, 0.5, WORLD - 0.5), clamp(dy + 0.5, 0.5, WORLD - 0.5), Math.min(sizeRef.current.w, sizeRef.current.h));
+      return placeWorld(dx, dy, selRef.current, (wpt.x - dx) * DISH, (wpt.y - dy) * DISH);
+    };
+    const startSpawn = (pid: number, px: number, py: number) => {
+      stopSpawn();
+      if (!spawnAt(px, py)) return; // мимо мира или нет места — не начинаем
+      spawnPid = pid;
+      spawnTimer = window.setInterval(() => {
+        if (!spawnAt(px, py)) stopSpawn();
+      }, SPAWN_MS);
     };
 
     const onDown = (e: PointerEvent) => {
@@ -492,7 +460,14 @@ export default function Page() {
         /* capture не критична */
       }
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: performance.now(), moved: false });
+      // одиночное нажатие крупным планом — начинается посев: организмы
+      // появляются, пока палец/кнопка мыши удерживается
+      if (pointers.size === 1 && runningRef.current && camRef.current.scale >= PLACE_PX) {
+        const rect = canvas.getBoundingClientRect();
+        startSpawn(e.pointerId, e.clientX - rect.left, e.clientY - rect.top);
+      }
       if (pointers.size === 2) {
+        stopSpawn();
         const [a, b] = [...pointers.values()];
         const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
         const wm = screenToWorld(mid.x, mid.y);
@@ -508,6 +483,7 @@ export default function Page() {
       p.x = e.clientX;
       p.y = e.clientY;
       if (Math.hypot(e.clientX - p.sx, e.clientY - p.sy) > 7) p.moved = true;
+      if (p.moved && spawnPid === e.pointerId) stopSpawn(); // повели палец — это панорама, не посев
       if (pointers.size === 1) {
         if (p.moved) {
           const cam2 = camRef.current;
@@ -533,9 +509,26 @@ export default function Page() {
       const p = pointers.get(e.pointerId);
       pointers.delete(e.pointerId);
       if (pointers.size < 2) pinch = null;
+      if (spawnPid === e.pointerId) stopSpawn();
       if (p && !p.moved && performance.now() - p.t < 400 && pointers.size === 0) {
         const rect = canvas.getBoundingClientRect();
-        tapAt(e.clientX - rect.left, e.clientY - rect.top);
+        const px = e.clientX - rect.left;
+        const py = e.clientY - rect.top;
+        const wpt = screenToWorld(px, py);
+        const dx = Math.floor(wpt.x);
+        const dy = Math.floor(wpt.y);
+        if (camRef.current.scale >= PLACE_PX) {
+          // вблизи организмы уже посеяны при нажатии; клик по бездне вне
+          // планеты — мягкий перелёт туда
+          if (!world.inWorld(dx, dy)) flyTo(clamp(dx + 0.5, 0.5, WORLD - 0.5), clamp(dy + 0.5, 0.5, WORLD - 0.5), Math.min(sizeRef.current.w, sizeRef.current.h));
+          return;
+        }
+        const now = performance.now();
+        const lt = lastTapRef.current;
+        const isDouble = now - lt.t < 320 && Math.hypot(px - lt.x, py - lt.y) < 36;
+        lastTapRef.current = { t: now, x: px, y: py };
+        if (isDouble) zoomAt(px, py, 2.2);
+        else flyTo(clamp(dx + 0.5, 0.5, WORLD - 0.5), clamp(dy + 0.5, 0.5, WORLD - 0.5), Math.min(sizeRef.current.w, sizeRef.current.h));
       }
     };
 
@@ -657,7 +650,6 @@ export default function Page() {
     let frames = 0;
     let stepAcc = 0;
     let cursor = 0;
-    let lastFocus = '';
     let lastDi = { x: 1 << 30, y: 1 << 30 };
     const aliveList: EcoRec[] = [];
     const matList: number[] = []; // блюдца, желающие материализоваться (ключи)
@@ -725,10 +717,9 @@ export default function Page() {
         lastDi = fd;
         trackerRef.current.reset();
         glowsRef.current = [];
-        lastFocus = '';
       }
       const r = world.peek(fd.x, fd.y);
-      // асинхронный анализ блюдца в фокусе: без синхронных readPixels
+      // асинхронный анализ блюдца в фокусе — для вспышек жизни
       const done = engine.pollStats();
       if (done) {
         statsCache = done.stats;
@@ -737,40 +728,17 @@ export default function Page() {
       const real = !!r && r.mat >= 0;
       const useReal = real && statsSlotFresh === r!.mat;
       if (real) engine.requestStats(r!.mat);
-      let st: PondStats = useReal ? statsCache : { mass: 0, pop: 0, blobs: [] };
-      let t = 0;
-      let events: { kind: EventKind; t: number; x: number; y: number }[] = [];
-      if (useReal) {
-        t = r!.matSteps * (1 / world.speciesT(r!.sp));
-        const stepsSince = Math.max(1, r!.matSteps - lastFocusSteps);
-        lastFocusSteps = r!.matSteps;
-        events = trackerRef.current.update(st.blobs, t, stepsSince);
-      } else {
+      if (!useReal) {
         trackerRef.current.reset();
-        t = Math.round(world.time);
         lastFocusSteps = r ? r.matSteps : 0;
+        return;
       }
+      const t = r!.matSteps * (1 / world.speciesT(r!.sp));
+      const stepsSince = Math.max(1, r!.matSteps - lastFocusSteps);
+      lastFocusSteps = r!.matSteps;
+      const events = trackerRef.current.update(statsCache.blobs, t, stepsSince);
       if (events.length > 0 && now - guardRef.current > 900) {
-        for (const ev of events.slice(0, 3)) {
-          glowsRef.current.push({ kind: ev.kind, x: ev.x, y: ev.y, born: now });
-          pushFeed(ev.kind, t, FEED_WORDS[ev.kind]);
-        }
-      }
-
-      const key = `${r ? r.sp : -1}|${r ? r.mat : -1}`;
-      if (key !== lastFocus || now - lastStats >= STATS_MS) {
-        lastFocus = key;
-        hudCbRef.current({
-          t,
-          pop: useReal ? st.pop : r ? Math.round(r.pop) : 0,
-          fps: Math.round(fpsRef.current),
-          spName: r && r.sp >= 0 ? world.speciesName(r.sp) : 'пусто',
-          spRole: r && r.sp >= 0 ? world.speciesRole(r.sp) : '',
-          real: useReal,
-          planet: world.aliveCount(),
-          species: world.aliveSpeciesCount(),
-          events: [...feedRef.current],
-        });
+        for (const ev of events.slice(0, 3)) glowsRef.current.push({ kind: ev.kind, x: ev.x, y: ev.y, born: now });
       }
     };
 
@@ -1045,26 +1013,7 @@ export default function Page() {
         stepAcc: +stepAcc.toFixed(2),
       }),
       fps: () => fpsRef.current,
-      place: (wx: number, wy: number, sp: number) => {
-        const had = world.peek(wx, wy);
-        if (!had) world.seedDish(wx, wy, sp, 1);
-        else if (world.speciesBase(had.sp) !== sp) world.seedDish(wx, wy, sp, Math.max(3, had.pop));
-        const r = world.peek(wx, wy);
-        if (!r) return;
-        let slot = r.mat;
-        if (slot < 0) {
-          slot = allocSlot(world.key(wx, wy));
-          if (slot < 0) return;
-          r.mat = slot;
-          r.matSerial = r.serial;
-          r.matSteps = 0;
-          r.mass = Math.max(0.004, r.pop / POP_PER_MASS);
-          engine.clearSlot(slot);
-          world.touch(r);
-          flushMeta();
-        }
-        engine.placeAdd(slot, sp, 0, DISH / 2, DISH / 2);
-      },
+      place: (wx: number, wy: number, sp: number) => placeWorld(wx, wy, sp, DISH / 2, DISH / 2),
       populate,
       clear,
     };
@@ -1074,6 +1023,7 @@ export default function Page() {
       if (document.hidden) {
         wasRunning = runningRef.current;
         runningRef.current = false;
+        stopSpawn();
       } else {
         runningRef.current = wasRunning;
       }
@@ -1081,6 +1031,7 @@ export default function Page() {
     document.addEventListener('visibilitychange', onVis);
 
     return () => {
+      stopSpawn();
       cancelAnimationFrame(rafRef.current);
       document.removeEventListener('visibilitychange', onVis);
       window.removeEventListener('keydown', onKey);
@@ -1095,7 +1046,7 @@ export default function Page() {
       worldRef.current = null;
       delete (window as unknown as { __pond?: object }).__pond;
     };
-  }, [pushFeed]);
+  }, []);
 
   /* ---------- рендер ---------- */
 
@@ -1152,13 +1103,11 @@ export default function Page() {
             <div className="mt-4 space-y-1 text-[11px] leading-relaxed text-neutral-500">
               <p>Тап — к блюдцу · двойной тап — зум · щипок или колесо — масштаб</p>
               <p>Пробел — пауза · на паузе заселение отключено</p>
-              <p>Выбери существо внизу и тапни по блюдцу — поселить</p>
+              <p>Выбери существо внизу, нажми на блюдце и держи — организмы появляются, пока держишь</p>
             </div>
           </div>
         </div>
       )}
-
-      <Hud callbackRef={hudCbRef} />
 
       <div className="rail absolute right-[max(0.75rem,env(safe-area-inset-right))] top-[max(0.75rem,env(safe-area-inset-top))] z-20">
         <RailBtn onClick={() => setRunning((r) => !r)} testid="playpause" label={running ? 'Пауза' : 'Пуск'} active>
@@ -1314,44 +1263,6 @@ function SpeedPanel({ value, onChange, onClose }: { value: number; onChange: (v:
         <p className="mt-2 text-[10px] leading-relaxed text-neutral-500">Клавиши 1–6 · большие скорости — максимум возможностей устройства</p>
       </div>
     </>
-  );
-}
-
-/* ---------- HUD: наблюдение за блюдцем под центром ---------- */
-
-function Hud({ callbackRef }: { callbackRef: { current: (s: HudSnap) => void } }) {
-  const [snap, setSnap] = useState<HudSnap>({ t: 0, pop: 0, fps: 0, spName: '', spRole: '', real: false, planet: 0, species: 0, events: [] });
-
-  useEffect(() => {
-    callbackRef.current = setSnap;
-    return () => {
-      callbackRef.current = () => {};
-    };
-  }, [callbackRef]);
-
-  return (
-    <div className="pointer-events-none absolute left-[max(0.75rem,env(safe-area-inset-left))] top-[max(0.75rem,env(safe-area-inset-top))] z-10 flex max-w-[54vw] flex-col gap-1.5">
-      <div data-testid="hud-card" className="rounded-2xl border border-emerald-500/25 bg-black/55 px-3 py-1.5 backdrop-blur [@media(pointer:coarse)]:hidden [@media(max-width:767px)]:hidden">
-        <div className="flex items-baseline gap-2">
-          <p data-testid="pop-count" className="text-xl font-extrabold leading-none tabular-nums text-neutral-100">
-            {snap.pop}
-          </p>
-          <p className="text-[9px] uppercase tracking-wider text-emerald-500/80">{plural(Math.abs(snap.pop))}</p>
-        </div>
-        <p className="mt-0.5 truncate text-[11px] text-neutral-400">{snap.spName}</p>
-        {snap.spRole && <p className="truncate text-[9px] uppercase tracking-wider text-cyan-400/70">{snap.spRole}</p>}
-        <p className="font-mono text-[9px] tabular-nums text-neutral-600">
-          {snap.real ? `шаг ${snap.t.toFixed(0)}` : `эпоха ${snap.t}`} · {snap.fps} fps · блюдц {snap.planet} · видов {snap.species}
-        </p>
-      </div>
-      <div className="max-w-full" data-testid="feed">
-        {snap.events.slice(0, 2).map((e) => (
-          <p key={e.id} className={`truncate font-mono text-[10px] leading-4 backdrop-blur-sm ${FEED_COLORS[e.kind]}`}>
-            {e.text}
-          </p>
-        ))}
-      </div>
-    </div>
   );
 }
 
