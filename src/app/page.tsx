@@ -3,18 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Plus, Minus, Maximize, Sprout, Trash2, Download } from 'lucide-react';
 import { POND_LIST, type Creature } from '@/lib/lenia/creatures';
-import { PondEngine, speciesColorJS, DISH, WORLD, LOD_HI, type PondStats } from '@/lib/lenia/engine';
+import { PondEngine, speciesColorJS, DISH, WORLD, LOD_HI } from '@/lib/lenia/engine';
 import { Biosphere, POP_PER_MASS, type EcoRec } from '@/lib/lenia/eco';
-import { BlobTracker, type EventKind } from '@/lib/lenia/tracker';
 
 const SPEED_MIN = 1;
 const SPEED_MAX = 100;
 const SPEED_PRESETS = [1, 2, 5, 10, 50, 100];
 const BASE_SPS = 12; // честных шагов Lenia на блюдце в секунду при ×1
 const PLACE_PX = 220; // блюдце крупнее этого — тап сажает существо, меньше — перелёт
-const STATS_MS = 500;
 const ECO_MS = 500;
-const GLOW_MS = 1500;
 const MAT_OPS = 24; // новых материализаций за кадр (плавно, без фризов)
 const MAT_MS = 200; // как часто пересобирается список желаемых блюдцев
 const BUBBLE_PX = 12; // px на блюдце: 12..14 — материализуется пузырь вокруг камеры
@@ -25,13 +22,6 @@ const SPAWN_MS = 200; // период появления организмов п
 const SPECIES: Creature[] = POND_LIST;
 
 const fmtSpeed = (v: number) => '×' + (Math.abs(v - Math.round(v)) < 0.001 ? String(Math.round(v)) : String(Math.round(v * 100) / 100));
-
-interface Glow {
-  kind: EventKind;
-  x: number;
-  y: number;
-  born: number;
-}
 
 interface VisRect {
   x0: number;
@@ -52,7 +42,6 @@ const cnt = (r: EcoRec) => clamp(Math.round(r.pop * 0.22), 4, 28);
 
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<PondEngine | null>(null);
   const worldRef = useRef<Biosphere | null>(null);
   const camRef = useRef({ x: WORLD / 2, y: WORLD / 2, scale: 60 });
@@ -66,8 +55,6 @@ export default function Page() {
   const selRef = useRef(0);
   const visRef = useRef<VisRect | null>(null);
   const guardRef = useRef(0);
-  const glowsRef = useRef<Glow[]>([]);
-  const trackerRef = useRef(new BlobTracker(DISH));
   const installEvtRef = useRef<Event | null>(null);
   const lastTapRef = useRef({ t: 0, x: 0, y: 0 });
   const actionsRef = useRef({ populate: () => {}, clear: () => {}, overview: () => {} });
@@ -125,8 +112,7 @@ export default function Page() {
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    const overlay = overlayRef.current;
-    if (!canvas || !overlay) return;
+    if (!canvas) return;
     let engine: PondEngine;
     try {
       engine = new PondEngine(canvas);
@@ -137,7 +123,6 @@ export default function Page() {
     engineRef.current = engine;
     const world = new Biosphere();
     worldRef.current = world;
-    const octx = overlay.getContext('2d');
 
     const coarse = window.matchMedia('(pointer: coarse)').matches;
     const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1.5 : 2);
@@ -239,8 +224,6 @@ export default function Page() {
       sizeRef.current = { w, h, dpr };
       canvas.width = Math.max(2, Math.round(w * dpr * rsRef.current));
       canvas.height = Math.max(2, Math.round(h * dpr * rsRef.current));
-      overlay.width = w;
-      overlay.height = h;
       clampCam();
     };
 
@@ -299,7 +282,8 @@ export default function Page() {
         engine.placeAdd(slot, world.speciesBase(sp), Math.floor(Math.random() * 4), lx, ly);
       },
       feed: () => {
-        /* текстового лога жизни больше нет — события видны вспышками */
+        /* ни текстового лога, ни вспышек событий: ничего лишнего не
+         * рисуется и не анализируется — кадр максимально лёгкий */
       },
     };
 
@@ -361,8 +345,6 @@ export default function Page() {
       matList.length = 0;
       world.reset(); // новая история зарождений
       engine.setMetaFull(world.metaBytes());
-      glowsRef.current = [];
-      trackerRef.current.reset();
     };
 
     const overview = () => flyTo(WORLD / 2, WORLD / 2, minScale());
@@ -425,8 +407,6 @@ export default function Page() {
       }
       engine.placeAdd(slot, sp, Math.floor(Math.random() * 4), lx, ly);
       r.matSerial = r.serial; // организм уже на GPU — пересев не нужен
-      r.flashKind = 1; // зелёная вспышка «рождение»
-      r.flashUntil = world.time + 0.9;
       world.touch(r);
       flushMeta();
       guardRef.current = performance.now();
@@ -618,46 +598,12 @@ export default function Page() {
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
 
-    /* ---- HUD и вспышки ---- */
-
-    const drawGlows = (now: number) => {
-      if (!octx) return;
-      const { w, h } = sizeRef.current;
-      const cam2 = camRef.current;
-      if (cam2.scale < 40) glowsRef.current = [];
-      const has = glowsRef.current.length > 0;
-      if (!has && !overlayDirty) return; // пусто и чисто — не трогаем канвас
-      overlayDirty = has;
-      octx.clearRect(0, 0, w, h);
-      if (!has) return;
-      const fd = focusDish();
-      glowsRef.current = glowsRef.current.filter((gl) => now - gl.born < GLOW_MS);
-      for (const gl of glowsRef.current) {
-        const age = Math.min(1, (now - gl.born) / GLOW_MS);
-        const wx = fd.x + (gl.x + 0.5) / DISH;
-        const wy = fd.y + (gl.y + 0.5) / DISH;
-        const sx = (wx - cam2.x) * cam2.scale + w / 2;
-        const sy = h / 2 - (wy - cam2.y) * cam2.scale;
-        const r = (3 + age * 13) * (cam2.scale / DISH);
-        octx.globalAlpha = (1 - age) * 0.85;
-        octx.strokeStyle = gl.kind === 'birth' ? '#34d399' : gl.kind === 'split' ? '#a3e635' : gl.kind === 'merge' ? '#fbbf24' : '#fb7185';
-        octx.lineWidth = 2.2 * (1 - age) + 0.5;
-        octx.beginPath();
-        octx.arc(sx, sy, r, 0, Math.PI * 2);
-        octx.stroke();
-      }
-      octx.globalAlpha = 1;
-    };
-
     let lastEco = 0;
-    let lastStats = 0;
     let lastFrame = 0;
     let frameDt = 0; // секунд с прошлого кадра (для темпа симуляции)
     let frames = 0;
     let stepAcc = 0;
     let cursor = 0;
-    let lastDi = { x: 1 << 30, y: 1 << 30 };
-    let overlayDirty = false; // был ли слой вспышек очищен (не дёргаем 2D-канвас зря)
     const aliveList: EcoRec[] = [];
     const matList: number[] = []; // блюдца, желающие материализоваться (ключи)
     let matStamp = 0;
@@ -671,9 +617,6 @@ export default function Page() {
     for (let i = 0; i < 2048; i++) stepPool.push({ slot: 0, sp: 0, m: 0.15, s: 0.015, T: 10 });
     let lodRenderRev = -1;
     let lodReadRev = -1;
-    let statsCache: PondStats = { mass: 0, pop: 0, blobs: [] };
-    let statsSlotFresh = -1;
-    let lastFocusSteps = 0;
 
     /** Пересобрать список желаемых блюдцев: видимая область при большом
      *  зуме, пузырь вокруг камеры — при среднем. Ближние — первыми. */
@@ -718,37 +661,6 @@ export default function Page() {
       matList.push(...want);
       matRadius = radius;
       matStamp = now;
-    };
-
-    const scan = (now: number) => {
-      const fd = focusDish();
-      if (fd.x !== lastDi.x || fd.y !== lastDi.y) {
-        lastDi = fd;
-        trackerRef.current.reset();
-        glowsRef.current = [];
-      }
-      const r = world.peek(fd.x, fd.y);
-      // асинхронный анализ блюдца в фокусе — для вспышек жизни
-      const done = engine.pollStats();
-      if (done) {
-        statsCache = done.stats;
-        statsSlotFresh = done.slot;
-      }
-      const real = !!r && r.mat >= 0;
-      const useReal = real && statsSlotFresh === r!.mat;
-      if (real) engine.requestStats(r!.mat);
-      if (!useReal) {
-        trackerRef.current.reset();
-        lastFocusSteps = r ? r.matSteps : 0;
-        return;
-      }
-      const t = r!.matSteps * (1 / world.speciesT(r!.sp));
-      const stepsSince = Math.max(1, r!.matSteps - lastFocusSteps);
-      lastFocusSteps = r!.matSteps;
-      const events = trackerRef.current.update(statsCache.blobs, t, stepsSince);
-      if (events.length > 0 && now - guardRef.current > 900) {
-        for (const ev of events.slice(0, 3)) glowsRef.current.push({ kind: ev.kind, x: ev.x, y: ev.y, born: now });
-      }
     };
 
     /* ---- главный цикл ---- */
@@ -905,8 +817,7 @@ export default function Page() {
           lodRenderRev = rev;
         }
         engine.regenMetaMips();
-        engine.render(cam, { x: cdx, y: cdy }, now / 1000, dpr * rsRef.current);
-        drawGlows(now);
+        engine.render(cam, now / 1000, dpr * rsRef.current);
 
         // тик биосферы: при высокой скорости — чаще, но с ограниченным dt
         const ecoEvery = engine.softGL ? 1000 : Math.max(140, Math.round(ECO_MS / Math.sqrt(speedRef.current)));
@@ -937,10 +848,6 @@ export default function Page() {
           if (runningRef.current) world.tick(Math.min(4, 0.5 * (ecoEvery / 500) * speedRef.current), hooks);
           world.buildMeta();
           flushMeta();
-        }
-        if (now - lastStats >= (engine.softGL ? 1000 : STATS_MS)) {
-          scan(now);
-          lastStats = now;
         }
       } catch (err) {
         runningRef.current = false;
@@ -1081,7 +988,6 @@ export default function Page() {
   return (
     <div className="fixed inset-0 overflow-hidden bg-[#040806] text-neutral-100" style={{ touchAction: 'none' }}>
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full touch-none select-none" aria-label="Пруд Лении" />
-      <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden />
 
       {error && (
         <div

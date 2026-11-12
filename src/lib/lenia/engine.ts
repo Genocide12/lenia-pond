@@ -262,7 +262,7 @@ void main() {
  *  - близко (≥32 px): честные клетки из слота, у стен — пустота.
  * Упаковка мета-тексселя: R = слот(ст.4б) + вид(мл.4б),
  * G = жизнь(6б) + вид(ст.2б) — виды id 0..61, B = слот(мл.8б),
- * A = вспышка (тип 3б + амплитуда 5б).
+ * A = 0 (зарезервировано; вспышки событий убраны — они тормозили кадр).
  * Цвет вида — hue из золотого сечения: каждый вид (в том числе
  * рождённый эволюцией) имеет свой узнаваемый цвет.
  */
@@ -277,7 +277,6 @@ uniform float uScale;
 uniform vec2 uRes;
 uniform float uTime;
 uniform float uGamma;
-uniform vec2 uFocus;
 out vec4 frag;
 
 const int LOD_LO = ${LOD_LO};
@@ -288,7 +287,6 @@ float hash12(vec2 p) {
   p3 += dot(p3, p3.yzx + 33.33);
   return fract((p3.x + p3.y) * p3.z);
 }
-float tri(float x) { return abs(fract(x) * 2.0 - 1.0); }
 float h21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float vnoise(vec2 p) {
   vec2 i = floor(p), f = fract(p);
@@ -384,9 +382,6 @@ void main() {
   int slotEnc = ((rb >> 4) << 8) + int(m.b * 255.0 + 0.5);
   int slot = slotEnc > 0 ? slotEnc - 1 : -1;
   float life = float(gb >> 2) / 63.0;
-  int fa = int(m.a * 255.0 + 0.5);
-  int fkind = fa >> 5;
-  float flash = float(fa & 31) / 31.0;
 
   // вода блюдца: вблизи — своя у каждого, вдали — глубокая гладь
   vec3 water = mix(vec3(0.014, 0.040, 0.044), vec3(0.043, 0.031, 0.013), h1) * (0.72 + 0.56 * h1);
@@ -434,21 +429,6 @@ void main() {
     col = water;
   }
 
-  // вспышки событий: кольцо вблизи, пульс всего блюдца вдали
-  // 1 рождение (зелёный), 2 болезнь (янтарный), 3 гибель (красный),
-  // 4 новый вид (фиолетовый), 5 симбиоз (циановый)
-  if (flash > 0.003 && fkind > 0) {
-    vec3 fc = fkind == 1 ? vec3(0.20, 0.90, 0.55) : fkind == 2 ? vec3(0.95, 0.75, 0.20) : fkind == 3 ? vec3(0.95, 0.35, 0.45) : fkind == 4 ? vec3(0.80, 0.60, 1.00) : vec3(0.45, 0.90, 0.95);
-    if (uScale > 14.0) {
-      vec2 dpx = min(f, vec2(1.0) - f) * uScale;
-      float edge = min(dpx.x, dpx.y);
-      float ring = 1.0 - smoothstep(0.0, 10.0, edge);
-      col = mix(col, fc, ring * flash * (0.55 + 0.45 * tri(uTime * 4.5)));
-    } else {
-      col = mix(col, fc, flash * 0.75);
-    }
-  }
-
   // сетка блюдцев вблизи
   if (uScale > 26.0) {
     vec2 dpx = min(f, vec2(1.0) - f) * uScale;
@@ -463,14 +443,6 @@ void main() {
   float rim = smoothstep(rimW, 0.0, min(din.x, din.y));
   col = mix(col, vec3(0.05, 0.22, 0.14), rim * 0.35);
 
-  // блюдце в фокусе камеры
-  if (uScale > 3.0 && abs(dishf.x - uFocus.x) < 0.5 && abs(dishf.y - uFocus.y) < 0.5) {
-    vec2 dpx = min(f, vec2(1.0) - f) * uScale;
-    float edge = min(dpx.x, dpx.y);
-    float glow = 1.0 - smoothstep(0.0, 3.0, edge);
-    float pulse = 0.5 + 0.3 * tri(uTime * 1.2);
-    col = mix(col, vec3(0.16, 0.85, 0.55), glow * pulse);
-  }
   // виньетка и мягкая тональная кривая — «киношный» вид пруда
   col *= 1.0 - 0.32 * dot(q, q);
   col = col / (col * 0.45 + 0.80);
@@ -555,9 +527,6 @@ export class PondEngine {
   private lodFence: (WebGLSync | null)[] = [];
   private lodPend = [false, false];
   private lodIdx = 0;
-  private statPbo: WebGLBuffer = null as unknown as WebGLBuffer;
-  private statFence: WebGLSync | null = null;
-  private statSlot = -1;
   // кэш поворотов существ: без аллокаций при посадках
   private rotCache: { w: number; h: number; cells: Float32Array }[][] = [];
   private rotFlip: Float32Array[][] = [];
@@ -698,9 +667,6 @@ export class PondEngine {
       this.lodPbo.push(b);
       this.lodFence.push(null);
     }
-    this.statPbo = gl.createBuffer()!;
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statPbo);
-    gl.bufferData(gl.PIXEL_PACK_BUFFER, this.pixelBuf.byteLength, gl.STREAM_READ);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
 
     // мета-текстура планеты: тексель = блюдце, мипы для дальнего плана
@@ -1083,50 +1049,6 @@ export class PondEngine {
     return this.analyzeSlot();
   }
 
-  /** Заказать асинхронный анализ слота — для постоянного наблюдения
-   *  за блюдцем в фокусе (без синхронных readPixels в кадре). */
-  requestStats(slot: number) {
-    if (this.statSlot >= 0) return;
-    const gl = this.gl;
-    const [ox, oy] = this.slotOrigin(slot);
-    gl.useProgram(this.progCopy);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.tex[0]);
-    gl.uniform1i(this.uni(this.progCopy, 'uSrc'), 0);
-    gl.uniform2i(this.uni(this.progCopy, 'uOffset'), ox, oy);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchFbo);
-    gl.viewport(0, 0, DISH, DISH);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statPbo);
-    gl.readPixels(0, 0, DISH, DISH, gl.RED, gl.FLOAT, 0);
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.statFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-    this.statSlot = slot;
-  }
-
-  /** Забрать готовый анализ (null — GPU ещё считает или заказа не было). */
-  pollStats(): { slot: number; stats: PondStats } | null {
-    if (this.statSlot < 0) return null;
-    const gl = this.gl;
-    if (this.statFence) {
-      const st = gl.clientWaitSync(this.statFence, 0, 0);
-      if (st === gl.TIMEOUT_EXPIRED) return null;
-      gl.deleteSync(this.statFence);
-      this.statFence = null;
-      if (st === gl.WAIT_FAILED) {
-        this.statSlot = -1;
-        return null;
-      }
-    }
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statPbo);
-    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, this.pixelBuf);
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-    const res = { slot: this.statSlot, stats: this.analyzeSlot() };
-    this.statSlot = -1;
-    return res;
-  }
-
   /** Анализ пикселей pixelBuf: масса + организмы (union-find). */
   private analyzeSlot(): PondStats {
     const buf = this.pixelBuf;
@@ -1238,7 +1160,6 @@ export class PondEngine {
   /** Нарисовать планету (один проход на весь экран). */
   render(
     cam: { x: number; y: number; scale: number },
-    focus: { x: number; y: number },
     timeSec: number,
     dpr: number,
     gamma = 0.75,
@@ -1261,7 +1182,6 @@ export class PondEngine {
     gl.uniform2f(this.uni(p, 'uRes'), canvas.width, canvas.height);
     gl.uniform1f(this.uni(p, 'uTime'), timeSec);
     gl.uniform1f(this.uni(p, 'uGamma'), gamma);
-    gl.uniform2f(this.uni(p, 'uFocus'), focus.x, focus.y);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -1281,8 +1201,6 @@ export class PondEngine {
     gl.deleteFramebuffer(this.scratchFbo);
     for (const b of this.lodPbo) gl.deleteBuffer(b);
     for (const f of this.lodFence) if (f) gl.deleteSync(f);
-    gl.deleteBuffer(this.statPbo);
-    if (this.statFence) gl.deleteSync(this.statFence);
     gl.deleteProgram(this.progStepInst);
     gl.deleteProgram(this.progCopyInst);
     gl.deleteProgram(this.progPerturb);

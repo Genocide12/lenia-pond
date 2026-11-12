@@ -111,8 +111,6 @@ export interface EcoRec {
   fromDir: number; // стена, через которую пришла колония (-1 — своя)
   sickUntil: number; // мировое время конца болезни (0 — здорова)
   sickK: number; // множитель угасания за тик болезни
-  flashKind: number; // 0 нет, 1 рождение, 2 болезнь, 3 гибель, 4 новый вид, 5 симбиоз
-  flashUntil: number; // мировое время конца вспышки
 }
 
 export type FeedKind =
@@ -366,7 +364,7 @@ export class Biosphere {
     const k = this.key(wx, wy);
     const old = this.recs.get(k);
     const r: EcoRec = old
-      ? { ...old, sp, pop, mass: clamp(pop / POP_PER_MASS, 0, 1), div: 0, sickUntil: 0, lean: 0, serial: old.serial + 1, flashKind: 1, flashUntil: this.time + 1.3 }
+      ? { ...old, sp, pop, mass: clamp(pop / POP_PER_MASS, 0, 1), div: 0, sickUntil: 0, lean: 0, serial: old.serial + 1 }
       : this.fresh(wx, wy, sp, pop);
     this.recs.set(k, r);
   }
@@ -490,8 +488,6 @@ export class Biosphere {
             // болезнь от скученности: заражение + постепенное угасание
             hooks.perturb(r.mat, 1, Math.random() * 100);
             this.sicken(r, 2.0 + Math.random() * 1.2, 0.8);
-            r.flashKind = 2;
-            r.flashUntil = this.time + 1.3;
             r.serial++;
             r.matSerial = r.serial; // заражение уже на GPU — колония продолжает жить
             feed('virus', r.wx, r.wy);
@@ -512,8 +508,6 @@ export class Biosphere {
           this.emigrate(r, hooks, feed);
         } else if (Math.random() < (plague * dt * (r.pop / cap)) / (0.4 + s.traits.armor)) {
           this.sicken(r, 2.4, 0.72);
-          r.flashKind = 2;
-          r.flashUntil = this.time + 1.3;
           feed('virus', r.wx, r.wy);
         } else if (Math.random() < 0.01 * dt * (0.25 + Math.min(1.5, r.pop / 100)) * (0.5 + s.traits.mutability)) {
           this.evolve(r, feed);
@@ -573,8 +567,6 @@ export class Biosphere {
         r.div = 0;
         this.nextSpeciateAt = this.time + 45 + Math.random() * 45;
         if (r.mat >= 0) r.matSerial = r.serial; // параметры шага меняются мягко, пересев не нужен
-        r.flashKind = 4;
-        r.flashUntil = this.time + 1.6;
         feed('speciate', r.wx, r.wy, `новый вид: ${child.name.toLowerCase()}`);
       } else {
         r.div = 0.45; // таблица видов полна — эволюция продолжится позже
@@ -595,10 +587,6 @@ export class Biosphere {
     if (Math.random() < 0.06 * sym) {
       a.pop = Math.min(sa.spill * 1.2, a.pop + 2.5);
       b.pop = Math.min(sb.spill * 1.2, b.pop + 2.5);
-      a.flashKind = 5;
-      a.flashUntil = this.time + 1.2;
-      b.flashKind = 5;
-      b.flashUntil = this.time + 1.2;
       feed('symbiosis', a.wx, a.wy, `симбиоз: ${sa.name.toLowerCase()} + ${sb.name.toLowerCase()}`);
       if (Math.random() < 0.06) this.hybridize(a, b, feed);
       return;
@@ -617,8 +605,6 @@ export class Biosphere {
     if (def.pop < Math.max(4, sdef.spill * 0.12)) {
       this.conquer(att, def, hooks, feed);
     } else {
-      def.flashKind = 2;
-      def.flashUntil = this.time + 1.0;
       if (def.mat >= 0) this.sicken(def, 1.2, 0.88); // раны
       feed('hunt', def.wx, def.wy, `${satt.name.toLowerCase()} охотится на ${sdef.name.toLowerCase()}`);
     }
@@ -637,8 +623,6 @@ export class Biosphere {
     def.sickUntil = 0;
     def.emitAt = this.time + 20 + Math.random() * 15;
     def.serial++;
-    def.flashKind = 3;
-    def.flashUntil = this.time + 1.5;
     if (def.mat >= 0) {
       const dx = Math.sign(def.wx - att.wx);
       const dy = Math.sign(def.wy - att.wy);
@@ -728,8 +712,6 @@ export class Biosphere {
       fromDir: -1,
       sickUntil: 0,
       sickK: 1,
-      flashKind: 1,
-      flashUntil: this.time + 1.3,
     };
   }
 
@@ -764,22 +746,15 @@ export class Biosphere {
   }
 
   /** Ячейка блюдца: R = слот(ст.4б) + вид(мл.4б), G = жизнь(6б) + вид(ст.2б),
-   *  B = слот(мл.8б), A = вспышка(тип 3б + амплитуда 5б). */
+   *  B = слот(мл.8б), A = 0 (зарезервировано). */
   private cell(r: EcoRec) {
     const life = r.mat >= 0 ? Math.min(1, r.mass * 2) : Math.sqrt(Math.min(1, r.pop / this.sp(r.sp).spill));
-    let kind = 0;
-    let amp = 0;
-    if (r.flashKind > 0 && r.flashUntil > this.time) {
-      kind = r.flashKind;
-      amp = Math.min(1, (r.flashUntil - this.time) / 1.3);
-    }
-    const life6 = Math.round(Math.min(1, life * (1 + 0.9 * amp)) * 63);
+    const life6 = Math.round(Math.min(1, life) * 63);
     const spEnc = r.sp + 1; // 1..62, 0 — мёртвое блюдце
     const slotEnc = r.mat >= 0 ? r.mat + 1 : 0;
     const rb = ((slotEnc >> 8) << 4) | (spEnc & 15);
     const g = (life6 << 2) | (spEnc >> 4);
-    const a = kind > 0 ? (kind << 5) | Math.round(31 * amp) : 0;
-    this.put(r.wx, r.wy, rb, g, slotEnc & 255, a);
+    this.put(r.wx, r.wy, rb, g, slotEnc & 255, 0);
   }
 
   private put(wx: number, wy: number, r: number, g: number, b: number, a: number) {
