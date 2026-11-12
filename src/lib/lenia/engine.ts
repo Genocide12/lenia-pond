@@ -27,8 +27,8 @@ export const WORLD = 2000; // блюдцев в стороне планеты �
 export const META = 2048; // сторона мета-текстуры планеты (тексель = блюдце)
 export const LOD_N = 10; // текселей LOD на блюдце по стороне
 export const LOD_CELL = DISH / LOD_N; // клеток, усредняемых в один тексель LOD
-export const LOD_LO = 32; // px на блюдце: ниже — чистый LOD-рендер
-export const LOD_HI = 64; // px на блюдце: выше — честная выборка клеток
+export const LOD_LO = 8; // px на блюдце: ниже — чистый LOD-рендер (клетки всё равно не видны)
+export const LOD_HI = 18; // px на блюдце: выше — честная выборка клеток (первозданный вид при фокусе)
 
 /* ---------- инстансинг шагов ---------- */
 
@@ -391,8 +391,10 @@ void main() {
   // вода блюдца: вблизи — своя у каждого, вдали — глубокая гладь
   vec3 water = mix(vec3(0.014, 0.040, 0.044), vec3(0.043, 0.031, 0.013), h1) * (0.72 + 0.56 * h1);
   water = mix(vec3(0.010, 0.028, 0.032), water, smoothstep(0.6, 2.5, uScale));
-  // тихий блеск воды — еле заметное течение
-  water += vec3(0.004, 0.011, 0.013) * vnoise(f * 6.0 + vec2(uTime * 0.04, -uTime * 0.03)) * smoothstep(3.0, 24.0, uScale);
+  // тихий блеск воды — еле заметное течение (шум считаем только там, где виден)
+  if (uScale > 3.0) {
+    water += vec3(0.004, 0.011, 0.013) * vnoise(f * 6.0 + vec2(uTime * 0.04, -uTime * 0.03)) * smoothstep(3.0, 24.0, uScale);
+  }
 
   vec3 col;
   if (slot >= 0 && sp >= 0) {
@@ -419,9 +421,13 @@ void main() {
     }
   } else if (sp >= 0) {
     // статистическое блюдце: цвет вида × уровень жизни, тихий ползущий шум
+    // (на обзоре шум не считаем — там он всё равно не виден, а пикселей миллионы)
     vec3 sc = speciesColor(sp, 0.80);
-    float n = vnoise(f * 3.0 + vec2(h1 * 17.0) + vec2(uTime * 0.05));
-    n = mix(0.5, n, smoothstep(1.5, 4.0, uScale));
+    float n = 0.5;
+    if (uScale > 1.5) {
+      n = vnoise(f * 3.0 + vec2(h1 * 17.0) + vec2(uTime * 0.05));
+      n = mix(0.5, n, smoothstep(1.5, 4.0, uScale));
+    }
     float vis = smoothstep(0.02, 0.30, life) * (0.72 + 0.38 * n);
     col = mix(water, sc, clamp(vis, 0.0, 1.0));
   } else {
@@ -560,7 +566,17 @@ export class PondEngine {
   private rev = 0; // версия состояния (менялся ли атлас — для LOD)
 
   constructor(canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
+    const gl = canvas.getContext('webgl2', {
+      antialias: false,
+      // высокопроизводительный GPU на гибридных ноутбуках (иначе браузер
+      // может отдать интегрированную карту — отсюда «лаги на мощном ПК»)
+      powerPreference: 'high-performance',
+      alpha: false, // холст непрозрачный — быстрее композиция
+      depth: false,
+      stencil: false,
+      // preserveDrawingBuffer не нужен: кадр рисуется каждый раз заново,
+      // а его принудительная копия тормозит некоторые драйверы
+    });
     if (!gl) throw new Error('WebGL2 не поддерживается этим браузером');
     if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('Расширение EXT_color_buffer_float недоступно');
     this.gl = gl;

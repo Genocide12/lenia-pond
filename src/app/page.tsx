@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Plus, Minus, Maximize, Sprout, Trash2, Download } from 'lucide-react';
 import { POND_LIST, type Creature } from '@/lib/lenia/creatures';
-import { PondEngine, speciesColorJS, DISH, WORLD, LOD_LO, LOD_HI, type PondStats } from '@/lib/lenia/engine';
+import { PondEngine, speciesColorJS, DISH, WORLD, LOD_HI, type PondStats } from '@/lib/lenia/engine';
 import { Biosphere, POP_PER_MASS, type EcoRec } from '@/lib/lenia/eco';
 import { BlobTracker, type EventKind } from '@/lib/lenia/tracker';
 
@@ -17,8 +17,9 @@ const ECO_MS = 500;
 const GLOW_MS = 1500;
 const MAT_OPS = 24; // новых материализаций за кадр (плавно, без фризов)
 const MAT_MS = 200; // как часто пересобирается список желаемых блюдцев
-const BUBBLE_PX = 12; // px на блюдце: 12..32 — материализуется пузырь вокруг камеры
-const BUBBLE_R = 12; // радиус пузыря (блюдцев)
+const BUBBLE_PX = 12; // px на блюдце: 12..14 — материализуется пузырь вокруг камеры
+const BUBBLE_R = 12; // минимальный радиус пузыря (блюдцев)
+const MAT_VIS_PX = 14; // px на блюдце: выше — материализуются все видимые блюдца
 const SPAWN_MS = 200; // период появления организмов при удержании нажатия
 
 const SPECIES: Creature[] = POND_LIST;
@@ -42,9 +43,12 @@ interface VisRect {
 
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
 
-/** Сколько организмов посадить при материализации блюдца: небольшая
- *  колония, которая честно разрастается сама — без «ста организмов сразу». */
-const cnt = (r: EcoRec) => clamp(Math.round(r.pop * 0.25), 3, 16);
+/** Сколько организмов посадить при материализации блюдца: колония,
+ *  соответствующая статистической популяции (≈0.012 массы на организм) —
+ *  при приближении камеры пятно НЕ схлопывается в точку, а продолжается
+ *  той же жизнью. Без «ста организмов сразу»: максимум 28, дальше —
+ *  честный рост самой Lenia. */
+const cnt = (r: EcoRec) => clamp(Math.round(r.pop * 0.22), 4, 28);
 
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -417,6 +421,7 @@ export default function Page() {
         r.matSerial = r.serial;
         r.matSteps = 0;
         r.mass = Math.max(0.004, r.pop / POP_PER_MASS);
+        r.seedMass = r.mass; // приживление без обвала пятна
       }
       engine.placeAdd(slot, sp, Math.floor(Math.random() * 4), lx, ly);
       r.matSerial = r.serial; // организм уже на GPU — пересев не нужен
@@ -618,12 +623,13 @@ export default function Page() {
     const drawGlows = (now: number) => {
       if (!octx) return;
       const { w, h } = sizeRef.current;
-      octx.clearRect(0, 0, w, h);
       const cam2 = camRef.current;
-      if (cam2.scale < 40 || glowsRef.current.length === 0) {
-        glowsRef.current = cam2.scale < 40 ? [] : glowsRef.current;
-        return;
-      }
+      if (cam2.scale < 40) glowsRef.current = [];
+      const has = glowsRef.current.length > 0;
+      if (!has && !overlayDirty) return; // пусто и чисто — не трогаем канвас
+      overlayDirty = has;
+      octx.clearRect(0, 0, w, h);
+      if (!has) return;
       const fd = focusDish();
       glowsRef.current = glowsRef.current.filter((gl) => now - gl.born < GLOW_MS);
       for (const gl of glowsRef.current) {
@@ -651,6 +657,7 @@ export default function Page() {
     let stepAcc = 0;
     let cursor = 0;
     let lastDi = { x: 1 << 30, y: 1 << 30 };
+    let overlayDirty = false; // был ли слой вспышек очищен (не дёргаем 2D-канвас зря)
     const aliveList: EcoRec[] = [];
     const matList: number[] = []; // блюдца, желающие материализоваться (ключи)
     let matStamp = 0;
@@ -677,7 +684,7 @@ export default function Page() {
       const want: number[] = [];
       zoneAKeys.clear();
       let radius = 0;
-      if (scale >= LOD_LO) {
+      if (scale >= MAT_VIS_PX) {
         const vx0 = Math.floor(cam.x - w / (2 * scale)) - 1;
         const vx1 = Math.ceil(cam.x + w / (2 * scale)) + 1;
         const vy0 = Math.floor(cam.y - h / (2 * scale)) - 1;
@@ -690,9 +697,11 @@ export default function Page() {
           }
         }
       } else if (scale >= BUBBLE_PX) {
-        radius = BUBBLE_R;
+        // пузырь материализации вокруг камеры — покрывает экран (с запасом),
+        // чтобы движущиеся существа в поле зрения сохраняли первозданный вид
+        radius = clamp(Math.ceil(Math.min(w, h) / scale / 2) + 2, BUBBLE_R, 26);
         for (const [k, r] of world.recs) {
-          if (Math.abs(r.wx - cam.x) <= BUBBLE_R && Math.abs(r.wy - cam.y) <= BUBBLE_R) {
+          if (Math.abs(r.wx - cam.x) <= radius && Math.abs(r.wy - cam.y) <= radius) {
             want.push(k);
             zoneAKeys.add(k);
           }
@@ -757,10 +766,12 @@ export default function Page() {
         lastFrame = now;
 
         // адаптация под устройство: бюджет шагов и разрешение рендера (цель — не ниже ~50 fps).
-        // падение — мгновенное (каждый кадр), рост — осторожный
-        if (emaRef.current > 21) budgetRef.current = Math.max(engine.softGL ? 0.5 : 8, budgetRef.current * 0.92);
+        // ema — реальное время КАДРА: в нём видно и опустошение очереди GPU,
+        // поэтому падение бюджета происходит и при GPU-перегрузе, а не только
+        // при тормозах JS. Падение — мгновенное, рост — осторожный.
+        if (emaRef.current > 21) budgetRef.current = Math.max(engine.softGL ? 0.5 : 8, budgetRef.current * (emaRef.current > 26 ? 0.85 : 0.93));
         if (++frames % 10 === 0) {
-          if (emaRef.current < 14.5) budgetRef.current = Math.min(engine.softGL ? 3 : 700, budgetRef.current * 1.3 + 3);
+          if (emaRef.current < 14.5) budgetRef.current = Math.min(engine.softGL ? 3 : 700, budgetRef.current * 1.12 + 1);
           const rs = rsRef.current;
           if (emaRef.current > 22 && rs > 0.45) {
             rsRef.current = Math.max(0.45, rs * 0.85);
@@ -810,6 +821,7 @@ export default function Page() {
           r.matSerial = r.serial;
           r.matSteps = 0;
           r.mass = Math.max(0.004, r.pop / POP_PER_MASS);
+          r.seedMass = r.mass; // льготный пол: пятно не гаснет при приближении
           engine.seedSlot(slot, world.speciesBase(r.sp), cnt(r), r.fromDir);
           world.touch(r);
           ops++;
@@ -825,23 +837,30 @@ export default function Page() {
 
         // честные шаги Lenia — ИНСТАНСИРОВАННЫМИ пакетами: один проход
         // на все блюдца вместо пары draw call на каждое. Ближний круг
-        // всегда получает полный темп — скорость видна при любом бюджете
+        // всегда получает полный темп — скорость видна при любом бюджете.
+        // pace масштабирует объём шагов по реальному времени кадра:
+        // очередь GPU опустошается, кадры выравниваются — без «дёрганого
+        // перегруза», который раньше превращался в многосекундные лаги.
         if (runningRef.current && aliveList.length > 0) {
           stepAcc += BASE_SPS * speedRef.current * frameDt;
           const share = Math.floor(stepAcc);
           stepAcc -= share;
           if (share > 0) {
+            const pace = clamp(16.7 / Math.max(emaRef.current, 0.5), 0.12, 1);
             nearList.length = 0;
             farList.length = 0;
             for (const r of aliveList) {
+              // остывшее блюдце (жизнь угасла на GPU) не шагаем — eco скоро
+              // похоронит его честно, а пустые свёртки только жгли время GPU
+              if (r.mass < 0.0006 && r.matSteps > 60) continue;
               const dx = r.wx - cam.x;
               const dy = r.wy - cam.y;
               if (dx * dx + dy * dy <= 9) nearList.push(r);
               else farList.push(r);
             }
             const nearTotalCap = engine.softGL ? 8 : 480;
-            const kNear = nearList.length > 0 ? Math.min(share, 64, Math.max(1, Math.floor(nearTotalCap / nearList.length))) : 0;
-            let budgetLeft = Math.min(Math.round(budgetRef.current), engine.softGL ? 12 : 4000) - kNear * nearList.length;
+            const kNear = nearList.length > 0 ? Math.min(Math.max(1, Math.round(share * pace)), 64, Math.max(1, Math.floor(nearTotalCap / nearList.length))) : 0;
+            let budgetLeft = Math.max(0, Math.round(Math.min(Math.round(budgetRef.current), engine.softGL ? 12 : 4000) * pace) - kNear * nearList.length);
             farSteps.length = farList.length;
             for (let i = 0; i < farList.length; i++) farSteps[i] = 0;
             let maxK = kNear;
@@ -853,9 +872,9 @@ export default function Page() {
               if (farSteps[i] > maxK) maxK = farSteps[i];
             }
             for (let p = 0; p < maxK; p++) {
-              // сторож кадра: проход 0 выполняется всегда (минимальный прогресс
-              // у всех блюдц), дальние проходы — пока есть запас времени кадра
-              if (p > 0 && performance.now() - now > 12) break;
+              // при реальной просадке кадра — только обязательный проход:
+              // минимум прогресса у всех блюдц, без наращивания очереди GPU
+              if (p > 0 && emaRef.current > 19.5) break;
               let cnt2 = 0;
               if (p < kNear) {
                 for (const r of nearList) {
@@ -901,7 +920,10 @@ export default function Page() {
           }
           if (lod) world.syncMasses(slotDish, lod, engine.lodTexSide, engine.slotSide);
           // кэш слотов: блюдца вне зоны детализации держат свою жизнь
-          // до 6 тиков — при возврате камеры колония не пересевается
+          // ~3.5 секунды (а не 6 тиков: на ×100 тик — 140 мс, жизнь
+          // стиралась бы меньше чем за секунду) — при возврате камеры
+          // колония продолжается с того же места, без всхлопываний
+          const cacheTicks = Math.max(6, Math.round(3500 / ecoEvery));
           for (let s = 0; s < SLOTS; s++) {
             const k = slotDish[s];
             if (k < 0) continue;
@@ -909,7 +931,7 @@ export default function Page() {
               cacheFor[s] = 0;
               continue;
             }
-            if (++cacheFor[s] > 6) releaseAndFree(s);
+            if (++cacheFor[s] > cacheTicks) releaseAndFree(s);
           }
           world.setCamera(cdx, cdy);
           if (runningRef.current) world.tick(Math.min(4, 0.5 * (ecoEvery / 500) * speedRef.current), hooks);

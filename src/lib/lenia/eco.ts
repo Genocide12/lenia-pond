@@ -105,6 +105,7 @@ export interface EcoRec {
   serial: number; // растёт при любом изменении экосистемы
   matSerial: number; // serial на момент материализации
   matSteps: number; // честные шаги Lenia в текущей материализации
+  seedMass: number; // масса на момент материализации: льготный пол приживления
   lean: number; // подряд голодных проб
   emitAt: number; // мировое время следующего переливания (блюдце полно)
   fromDir: number; // стена, через которую пришла колония (-1 — своя)
@@ -380,7 +381,13 @@ export class Biosphere {
   }
 
   /** Синхронизировать массы/популяции материализованных блюдц из
-   *  LOD-текстуры движка (слот → блюдце через slotDish). */
+   *  LOD-текстуры движка (слот → блюдце через slotDish).
+   *
+   *  Льготный период приживления: только что материализованное блюдце
+   *  (matSteps < 48) не роняет массу ниже посева — честная колония на GPU
+   *  разрастается до статистической за пару секунд, а чтение LOD могло
+   *  произойти ещё до посева (асинхронный PBO) — раньше это обнуляло
+   *  пятно в момент приближения камеры. */
   syncMasses(slotDish: Int32Array, lod: Float32Array, lodSide: number, slotSide: number) {
     for (let slot = 0; slot < slotDish.length; slot++) {
       const k = slotDish[slot];
@@ -394,7 +401,11 @@ export class Biosphere {
         const row = (sy * LOD_N + y) * lodSide + sx * LOD_N;
         for (let x = 0; x < LOD_N; x++) s += lod[row + x];
       }
-      r.mass = s / (LOD_N * LOD_N);
+      let m = s / (LOD_N * LOD_N);
+      if (r.matSteps < 48 && r.seedMass > m) {
+        m = Math.max(m, r.seedMass * (1 - r.matSteps / 48));
+      }
+      r.mass = m;
       r.pop = clamp(r.mass * POP_PER_MASS, 0.5, DISH_CAP * 1.1);
     }
   }
@@ -711,6 +722,7 @@ export class Biosphere {
       serial: 1,
       matSerial: 0,
       matSteps: 0,
+      seedMass: clamp(pop / POP_PER_MASS, 0, 1),
       lean: 0,
       emitAt: this.time + 20 + Math.random() * 15,
       fromDir: -1,
