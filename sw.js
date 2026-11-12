@@ -1,6 +1,6 @@
 /* Service worker пруда: навигация — сеть-первична (свежая версия),
    остальное — кэш-первичен (мгновенный старт, оффлайн). */
-const CACHE = 'pond-v6';
+const CACHE = 'pond-v7';
 
 self.addEventListener('install', (e) => {
   e.waitUntil(
